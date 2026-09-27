@@ -195,10 +195,12 @@ The bridge can build a substitute DLAA session from the frame, ReShade's depth, 
    `synth=1` (*Replace DLSS when the game isn't using its own* in the bridge's panel) enables the
    substitute session, and `ofa_grid=0` takes motion vectors from the ReShade shader instead of
    optical flow.
-4. Make sure ReShade sees the game's depth: enable the **DisplayDepth** effect and adjust ReShade's
-   depth settings (upside down, reversed, logarithmic) until near objects are dark and far ones
-   light, then disable it again. The bridge's panel shows whether depth and motion inputs are
-   bound.
+4. Make sure ReShade is using the right depth buffer. ReShade's built-in **Generic Depth** add-on
+   (overlay → *Add-ons* tab) lists every depth buffer the game draws to; if it picks the wrong one,
+   tick the correct one there (the one with the most draw calls is usually it). Enable the
+   **DisplayDepth** effect to check: adjust ReShade's depth settings (upside down, reversed,
+   logarithmic) until near objects are dark and far ones light, then disable it again. The
+   bridge's panel shows whether depth and motion inputs are bound.
 
 Tested under Proton with Dark Souls Remastered (D3D11). The substitute is a real DLSS session fed
 approximated inputs, so text can soften and dense
