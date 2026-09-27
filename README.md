@@ -6,37 +6,22 @@
 A ReShade add-on that makes **NVIDIA DLSS 5 Neural Rendering** (DLSSNR — NGX feature 18)
 run on **Linux / Proton**.
 
-The closed RenoDX DLSS5 add-on produces a black screen on Linux because the driver-dispatched
-feature 18 fails `FAIL_OutOfDate`: the NGX OTA updater it relies on is unavailable under Proton.
-This add-on instead drives the game-local `nvngx_dlssnr.dll` snippet **directly** as feature 18,
-through a tiny forwarder DLL whose filename contains `nvngx.dll` to satisfy the snippet's caller
-gate — bypassing driver dispatch entirely.
+It drives the game-local `nvngx_dlssnr.dll` snippet **directly** as feature 18, through a tiny
+forwarder DLL whose filename contains `nvngx.dll` to satisfy the snippet's caller gate, so it runs
+without the driver's NGX dispatch or its OTA updater.
 
-> **This project exists thanks to [NapXDD](https://github.com/NapXDD)'s
-> [addon-dlssnr-linux](https://github.com/NapXDD/addon-dlssnr-linux).** NapXDD did the hard part:
-> getting feature 18 to run under Proton at all. The forwarder, the NGX hooks, feature creation
-> and the compose pipeline are all their work; this fork only builds on top of it. NapXDD's add-on
-> in turn builds on the Neural Rendering recipe from
-> [Dagherbou's OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), itself a fork of
-> [OptiScaler](https://github.com/optiscaler/OptiScaler).
->
-> Lineage: OptiScaler → OptiScaler_DLSSNR (Dagherbou) → addon-dlssnr-linux (NapXDD) → this fork.
+Highlights:
 
-This fork reworks the colour bridge and the controls to follow the RenoDX DLSS5 add-on:
-
-- **Encoding + Diffuse White instead of a measured white point.** Upstream measured the frame's
-  log-average luminance every frame and used it as an auto-exposure white point, which pumps with
-  the scene and leaves black spots in highlights. The source is now decoded from a chosen encoding
-  (Auto, Linear BT.709, sRGB, BT.2100 PQ, scRGB, scRGB-nl) and normalised to a fixed diffuse white
-  in nits, with RenoDX's defaults. The old behaviour is still there as *Measured (legacy)*.
-- **A gentler curve.** The model is shown the frame exactly up to 0.8x diffuse white; only
+- **Encoding + Diffuse White.** The game's frame is decoded from its encoding (Auto, Linear
+  BT.709, sRGB, BT.2100 PQ, scRGB, scRGB-nl) and normalised to a fixed diffuse white in nits, so
+  what the model sees doesn't shift with scene brightness.
+- **A gentle curve.** The model is shown the frame exactly up to 0.8x diffuse white; only
   highlights above that are rolled off. SDR content reaches the model almost untouched.
-- **RenoDX-style controls**, including Auto Mask, Skin Structure Strength and UI Correction, applied
-  as soon as a slider is released (no Apply button).
+- **RenoDX-style controls**: Style, the model intensities, Auto Mask, Skin Structure Strength and
+  UI Correction, applied as soon as a slider is released.
 - **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
-
-The file names (`dlssnr-linux.addon64`, `nvngx.dll_nrfwd.dll`) and the `[ADDON_DLSSNR_LINUX]`
-ini section are unchanged, so it drops in over an upstream install; old settings are migrated.
+- **Works in games without DLSS 5 support**, through
+  [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
 
 Built on Linux with clang targeting the MSVC ABI (`-target x86_64-pc-windows-msvc`) so the
 vtables and by-value aggregate returns match MSVC-built ReShade.
@@ -79,7 +64,7 @@ preset resolves to the same model.
 
 | Setting | Notes |
 |---|---|
-| Encoding | How the game's DLSS output is encoded. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). *Measured (legacy)* is upstream's auto-exposure behaviour. |
+| Encoding | How the game's DLSS output is encoded. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). *Measured (legacy)* instead measures the frame's average brightness every frame and uses it as the white point. |
 | Diffuse White (nits) | The brightness shown to the model as paper white. Defaults as in RenoDX: 100 for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
 
 **Composition**
@@ -97,7 +82,7 @@ forwarder). Grab them from a [GitHub Release](../../releases) (every version tag
 every push also uploads them as a downloadable CI artifact), or build them yourself (see below —
 `build.sh` copies them straight into the game folder for you).
 
-See the upstream [**Tested Games**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games) wiki
+See NapXDD's [**Tested Games**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games) wiki
 page for titles this has been tried in — and please add your own results there.
 
 ### Prerequisites
@@ -121,11 +106,12 @@ page for titles this has been tried in — and please add your own results there
 
 **Tested environments:**
 
-- Upstream: NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6 (**X11**
+- addon-dlssnr-linux (NapXDD): NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6 (**X11**
   session, kwin 6.7.3) · Proton.
 - This fork: RTX 5070 Ti Laptop · CachyOS · proton-cachyos-slr. Dark Souls Remastered (D3D11,
-  through dlss5-bridge) and High on Life. Other RTX 50/40 cards, drivers, and compositors are expected
-to work but are untested — see the upstream [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
+  dlss5-bridge substitute session) and High on Life.
+
+Other RTX 50/40 cards, drivers, and compositors are expected to work but are untested — see NapXDD's [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
 wiki and please report your own setup.
 
 > **First, make sure the game itself runs on Proton.** Check
@@ -154,7 +140,7 @@ wiki and please report your own setup.
    PROTON_FORCE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
    ```
 
-   See the upstream [**Launch Options**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Launch-Options)
+   See NapXDD's [**Launch Options**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Launch-Options)
    wiki page for the full story: what each variable does per Proton build, the
    `d3dcompiler_47` override for ReShade effects, how to verify from `ReShade.log`, and the
    logging line to use when reporting a crash.
@@ -165,6 +151,58 @@ wiki and please report your own setup.
 
 > ⚠️ Third-party add-ons in an online game with anti-cheat carry a risk to your account. Use at
 > your own risk.
+
+## Games without DLSS 5 support
+
+The add-on hooks a D3D12 DLSS Super Resolution session, which only native D3D12 games with DLSS
+have. Everything else goes through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), a
+ReShade add-on that gives the game a private D3D12 DLSS session for this add-on to hook. Download
+it only from its GitHub releases, and put `dlss5-bridge.addon64` beside the game executable with
+this add-on's files.
+
+In `dlss5-bridge.cfg` (written on first launch) always set:
+
+```
+unwrap=0
+```
+
+With the default `unwrap=1`, the bridge delivers no frames to this add-on under Proton.
+
+### D3D11 or Vulkan games with DLSS
+
+The bridge mirrors the game's own DLSS onto its D3D12 session automatically. Turn DLSS on in the
+game. *Encoding → Auto* picks the right decode for the bridge's output. This route hasn't been
+tested with this add-on yet; reports welcome.
+
+### Games without any DLSS
+
+The bridge can build a substitute DLAA session from the frame, ReShade's depth, and motion vectors.
+
+1. Copy an **`nvngx_dlss.dll` of version 3.1.13 or newer** from any game that ships DLSS into
+   the game folder. The game has none, and the driver doesn't supply one there.
+2. Install [**iMMERSE**](https://github.com/martymcmodding/iMMERSE) from Marty's Mods (the
+   ReShade installer offers it) and enable the **MartysMods_Launchpad** effect. Launchpad
+   computes the motion vectors the bridge feeds to DLSS. NVIDIA's hardware optical flow, the
+   bridge's other motion source, isn't available under Proton.
+3. In `dlss5-bridge.cfg` set:
+
+   ```
+   synth=1
+   ofa_grid=0
+   unwrap=0
+   ```
+
+   `synth=1` (*Replace DLSS when the game isn't using its own* in the bridge's panel) enables the
+   substitute session, and `ofa_grid=0` takes motion vectors from the ReShade shader instead of
+   optical flow.
+4. Make sure ReShade sees the game's depth: enable the **DisplayDepth** effect and adjust ReShade's
+   depth settings (upside down, reversed, logarithmic) until near objects are dark and far ones
+   light, then disable it again. The bridge's panel shows whether depth and motion inputs are
+   bound.
+
+Tested under Proton with Dark Souls Remastered (D3D11). The substitute is a real DLSS session fed
+approximated inputs, so text can soften and dense
+foliage can smear a little.
 
 ## Building
 
@@ -203,6 +241,20 @@ Hit a problem, or got it working somewhere new? Please
 which identifies the model build you were running.
 
 ## Credits & acknowledgements
+
+> **This project exists thanks to [NapXDD](https://github.com/NapXDD)'s
+> [addon-dlssnr-linux](https://github.com/NapXDD/addon-dlssnr-linux).** NapXDD did the hard part:
+> getting feature 18 to run under Proton at all. The forwarder, the NGX hooks, feature creation
+> and the compose pipeline are all their work; this project only builds on top of it. NapXDD's
+> add-on in turn builds on the Neural Rendering recipe from
+> [Dagherbou's OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), itself a fork of
+> [OptiScaler](https://github.com/optiscaler/OptiScaler).
+>
+> Lineage: OptiScaler → OptiScaler_DLSSNR (Dagherbou) → addon-dlssnr-linux (NapXDD) → this fork.
+>
+> The file names (`dlssnr-linux.addon64`, `nvngx.dll_nrfwd.dll`) and the `[ADDON_DLSSNR_LINUX]`
+> ini section are NapXDD's, kept so this drops in over an addon-dlssnr-linux install; old
+> settings are migrated.
 
 This project was studied from, and stands on, the following work. Please support the originals.
 
