@@ -1,6 +1,6 @@
-# addon-dlssnr-linux
+# reshade-dlss5-linux
 
-[![build](https://github.com/NapXDD/addon-dlssnr-linux/actions/workflows/build.yml/badge.svg)](https://github.com/NapXDD/addon-dlssnr-linux/actions/workflows/build.yml)
+[![build](https://github.com/RianGoossens/reshade-dlss5-linux/actions/workflows/build.yml/badge.svg)](https://github.com/RianGoossens/reshade-dlss5-linux/actions/workflows/build.yml)
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
 A ReShade add-on that makes **NVIDIA DLSS 5 Neural Rendering** (DLSSNR — NGX feature 18)
@@ -12,6 +12,24 @@ This add-on instead drives the game-local `nvngx_dlssnr.dll` snippet **directly*
 through a tiny forwarder DLL whose filename contains `nvngx.dll` to satisfy the snippet's caller
 gate — bypassing driver dispatch entirely.
 
+This is a fork of [NapXDD/addon-dlssnr-linux](https://github.com/NapXDD/addon-dlssnr-linux),
+which did the hard part of getting feature 18 to run under Proton at all. The fork reworks the colour
+bridge and the controls to follow the RenoDX DLSS5 add-on:
+
+- **Encoding + Diffuse White instead of a measured white point.** Upstream measured the frame's
+  log-average luminance every frame and used it as an auto-exposure white point, which pumps with
+  the scene and leaves black spots in highlights. The source is now decoded from a chosen encoding
+  (Auto, Linear BT.709, sRGB, BT.2100 PQ, scRGB, scRGB-nl) and normalised to a fixed diffuse white
+  in nits, with RenoDX's defaults. The old behaviour is still there as *Measured (legacy)*.
+- **A gentler curve.** The model is shown the frame exactly up to 0.8x diffuse white; only
+  highlights above that are rolled off. SDR content reaches the model almost untouched.
+- **RenoDX-style controls**, including Auto Mask, Skin Structure Strength and UI Correction, applied
+  as soon as a slider is released (no Apply button).
+- **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
+
+The file names (`dlssnr-linux.addon64`, `nvngx.dll_nrfwd.dll`) and the `[ADDON_DLSSNR_LINUX]`
+ini section are unchanged, so it drops in over an upstream install; old settings are migrated.
+
 Built on Linux with clang targeting the MSVC ABI (`-target x86_64-pc-windows-msvc`) so the
 vtables and by-value aggregate returns match MSVC-built ReShade.
 
@@ -19,17 +37,50 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
 
 1. Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft Detours) to learn the
    live DLSS-SR geometry and formats.
-2. After each DLSS-SR evaluate, runs the DLSSNR model once on that frame and composites its answer
-   back over the game's output, so the game's own tone-mapping consumes the enhanced frame.
-3. A colour bridge (display-referred encode with a measured white point, anchored resolve that
-   preserves the game's hue) keeps the model — trained on display-referred data — from producing a
-   veil, noise, or a colour cast.
+2. After each DLSS-SR evaluate, runs the DLSSNR model on that frame (once per pass) and composites
+   its answer back over the game's output, so the game's own tone-mapping consumes the enhanced
+   frame.
+3. A colour bridge keeps the model, which was trained on display-referred data, from producing a
+   veil, noise, or a colour cast. The frame is decoded from its encoding, normalised to diffuse
+   white, and shown to the model display-referred. The model's answer is then anchored to the
+   original, keeping the game's own hue by default.
 
-The overlay (ReShade *Add-ons* tab, or F10 to A/B the pass) exposes detail/colour/highlight
-controls, a measured white-point readout, debug views, model **Style** (Default / Natural /
-Cinematic), and the three DLSS5 model intensities: **NR intensity** (`DLSSNR.Intensity`),
-**Structure intensity** (`DLSSNR.LocalStructureStrength`), **Global intensity**
-(`DLSSNR.LocalToneStrength`).
+## Settings
+
+Open the ReShade overlay → *Add-ons* → **DLSSNR Linux**. **F10** toggles the pass for A/B
+comparison. Settings are saved to `ReShade.ini` under `[ADDON_DLSSNR_LINUX]`.
+
+**Neural Rendering** (the model's own parameters; changing one rebuilds the model on release)
+
+| Setting | Parameter | Notes |
+|---|---|---|
+| Style | `DLSSNR.Style` | Model A, B or C. They look distinctly different. |
+| Overall Intensity | `DLSSNR.Intensity` | 0–1. The model caps it at 1. |
+| Structure Intensity | `DLSSNR.LocalStructureStrength` | Fine detail the model synthesises. |
+| Local Tone Intensity | `DLSSNR.LocalToneStrength` | Local contrast and tone. |
+| Auto Mask | `DLSSNR.UseAutoMask` | Detects characters so they can be treated separately. |
+| Skin Structure Strength | `DLSSNR.SkinStructureStrength` | Structure on detected characters (needs Auto Mask). |
+| UI Correction | `DLSSNR.UICorrection` | Lets the model protect UI it detects. |
+| Pass Count | — | 1–4. Each pass is its own model instance fed the previous pass's answer. Every pass costs a full evaluation and its own VRAM. |
+
+RenoDX's *Global Tone Intensity* and the render preset hint are not exposed: the tested
+`nvngx_dlssnr.dll` never reads `GlobalToneStrength`, and it embeds a single weight set, so every
+preset resolves to the same model.
+
+**Encoding**
+
+| Setting | Notes |
+|---|---|
+| Encoding | How the game's DLSS output is encoded. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). *Measured (legacy)* is upstream's auto-exposure behaviour. |
+| Diffuse White (nits) | The brightness shown to the model as paper white. Defaults as in RenoDX: 100 for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
+
+**Composition**
+
+| Setting | Notes |
+|---|---|
+| Detail strength | How far the frame moves toward the model's answer. 0 = bypass. |
+| Colour strength | 0 keeps the game's own hue; only brightness carries the model's change. 1 takes the model's colour too. |
+| Debug view | What the model sees, the model's answer, or the difference ×20. |
 
 ## Installing the build
 
@@ -38,7 +89,7 @@ forwarder). Grab them from a [GitHub Release](../../releases) (every version tag
 every push also uploads them as a downloadable CI artifact), or build them yourself (see below —
 `build.sh` copies them straight into the game folder for you).
 
-See the [**Tested Games**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games) wiki
+See the upstream [**Tested Games**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games) wiki
 page for titles this has been tried in — and please add your own results there.
 
 ### Prerequisites
@@ -49,6 +100,8 @@ page for titles this has been tried in — and please add your own results there
 - **Proton** with NVAPI/NGX enabled, and **DLSS (Super Resolution) turned on in-game**: this add-on
   runs off the game's DLSS-SR output, so DLSS must be active.
 - **ReShade with add-on support** installed for the game's DX12 renderer (the `dxgi` variant).
+  D3D11 games work through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which gives them
+  a D3D12 DLSS session to hook; keep its `unwrap=0`.
 - The DLSS Neural Rendering model **`nvngx_dlssnr.dll`** present beside the game executable. It is
   NVIDIA's and is *not* shipped here; the add-on only drives it.
   **The model build matters:** the add-on has only run stably with this exact model —
@@ -58,9 +111,13 @@ page for titles this has been tried in — and please add your own results there
   model's version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`)
   and warns when it isn't the tested build.
 
-**Tested environment:** NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6
-(**X11** session, kwin 6.7.3) · Proton. Other RTX 50/40 cards, drivers, and compositors are expected
-to work but are untested — see the [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
+**Tested environments:**
+
+- Upstream: NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6 (**X11**
+  session, kwin 6.7.3) · Proton.
+- This fork: RTX 5070 Ti Laptop · CachyOS · proton-cachyos-slr. Dark Souls Remastered (D3D11,
+  through dlss5-bridge) and High on Life. Other RTX 50/40 cards, drivers, and compositors are expected
+to work but are untested — see the upstream [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
 wiki and please report your own setup.
 
 > **First, make sure the game itself runs on Proton.** Check
@@ -89,7 +146,7 @@ wiki and please report your own setup.
    PROTON_FORCE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
    ```
 
-   See the [**Launch Options**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Launch-Options)
+   See the upstream [**Launch Options**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Launch-Options)
    wiki page for the full story: what each variable does per Proton build, the
    `d3dcompiler_47` override for ReShade effects, how to verify from `ReShade.log`, and the
    logging line to use when reporting a crash.
@@ -133,14 +190,17 @@ build to regression-test the retire/rebuild path against the DLSS SDK sample app
 ## Issues & support
 
 Hit a problem, or got it working somewhere new? Please
-[**open an issue**](https://github.com/NapXDD/addon-dlssnr-linux/issues) — I'll try my best to
-answer it. Include your GPU, NVIDIA driver version, Proton build, the game, and any relevant
+[**open an issue**](https://github.com/RianGoossens/reshade-dlss5-linux/issues). Include your GPU, NVIDIA driver version, Proton build, the game, and any relevant
 `nr-fwd:` lines from `ReShade.log` — especially the `nr-fwd: model nvngx_dlssnr.dll ...` line,
 which identifies the model build you were running.
 
 ## Credits & acknowledgements
 
 This project was studied from, and stands on, the following work. Please support the originals.
+
+- **addon-dlssnr-linux** by NapXDD (<https://github.com/NapXDD/addon-dlssnr-linux>) — GPL-3.0.
+  This is a fork of it: the forwarder, the NGX hooks, feature creation and the compose pipeline are
+  NapXDD's work.
 
 - **OptiScaler** and the **OptiScaler_DLSSNR** fork
   (<https://github.com/Dagherbou/OptiScaler_DLSSNR>, <https://github.com/optiscaler/OptiScaler>) —
@@ -151,7 +211,8 @@ This project was studied from, and stands on, the following work. Please support
   GPL-3.0 too** (see [LICENSE](LICENSE)).
 - **RenoDX** by Carlos Lopez Jr. (<https://github.com/clshortfuse/renodx>) — MIT. The ReShade
   add-on approach, the DLSS5 colour-bridge composition concepts (display-referred encode, anchored
-  resolve, measured white point), and the three DLSS5 model-intensity controls.
+  resolve), the Encoding / Diffuse White model and its defaults, and the layout of the Neural
+  Rendering controls.
 - **ReShade** by Patrick Mours (<https://github.com/crosire/reshade>) — the add-on SDK / API this
   loads into.
 - **Microsoft Detours** (<https://github.com/microsoft/Detours>) — MIT. Used to hook NGX.
