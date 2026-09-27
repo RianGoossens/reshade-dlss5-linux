@@ -202,6 +202,11 @@ The bridge can build a substitute DLAA session from the frame, ReShade's depth, 
    logarithmic) until near objects are dark and far ones light, then disable it again. The
    bridge's panel shows whether depth and motion inputs are bound.
 
+   The bridge reads depth through a loaded effect that uses it, not from Generic Depth directly.
+   Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off: with either on,
+   only enabled effects load, and the bridge reports no depth buffer even when Generic Depth has
+   the right one selected.
+
 Tested under Proton with Dark Souls Remastered (D3D11). The substitute is a real DLSS session fed
 approximated inputs, so text can soften and dense
 foliage can smear a little.
