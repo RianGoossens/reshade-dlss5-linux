@@ -12,9 +12,17 @@ This add-on instead drives the game-local `nvngx_dlssnr.dll` snippet **directly*
 through a tiny forwarder DLL whose filename contains `nvngx.dll` to satisfy the snippet's caller
 gate — bypassing driver dispatch entirely.
 
-This is a fork of [NapXDD/addon-dlssnr-linux](https://github.com/NapXDD/addon-dlssnr-linux),
-which did the hard part of getting feature 18 to run under Proton at all. The fork reworks the colour
-bridge and the controls to follow the RenoDX DLSS5 add-on:
+> **This project exists thanks to [NapXDD](https://github.com/NapXDD)'s
+> [addon-dlssnr-linux](https://github.com/NapXDD/addon-dlssnr-linux).** NapXDD did the hard part:
+> getting feature 18 to run under Proton at all. The forwarder, the NGX hooks, feature creation
+> and the compose pipeline are all their work; this fork only builds on top of it. NapXDD's add-on
+> in turn builds on the Neural Rendering recipe from
+> [Dagherbou's OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), itself a fork of
+> [OptiScaler](https://github.com/optiscaler/OptiScaler).
+>
+> Lineage: OptiScaler → OptiScaler_DLSSNR (Dagherbou) → addon-dlssnr-linux (NapXDD) → this fork.
+
+This fork reworks the colour bridge and the controls to follow the RenoDX DLSS5 add-on:
 
 - **Encoding + Diffuse White instead of a measured white point.** Upstream measured the frame's
   log-average luminance every frame and used it as an auto-exposure white point, which pumps with
@@ -219,6 +227,10 @@ This project was studied from, and stands on, the following work. Please support
 - **Dear ImGui** by Omar Ocornut (<https://github.com/ocornut/imgui>) — MIT. Overlay UI.
 - **NVIDIA NGX / DLSS SDK** — headers only, used under NVIDIA's SDK licence. The DLSS runtime and
   models are NVIDIA's; this add-on ships none of them.
+
+## AI assistance
+
+AI coding tools were used in the making of this fork.
 
 ## Disclaimer
 
