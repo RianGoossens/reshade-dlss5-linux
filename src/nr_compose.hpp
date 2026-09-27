@@ -69,6 +69,27 @@ inline void Release() {
   c = {};
 }
 
+struct Params {
+  float transfer;
+  float max_ratio;
+  float colour;
+  float white_point;
+  uint32_t debug;
+  uint32_t width;
+  uint32_t height;
+  uint32_t encoding;  // ENC_* in nr_common.hlsli
+  uint32_t curve;     // CURVE_* in nr_common.hlsli
+};
+constexpr uint32_t kNumConstants = sizeof(Params) / 4;
+static_assert(kNumConstants == 9, "Params must match the cbuffer in nr_common.hlsli");
+
+// The encoding and white point shared by both halves of a frame.
+struct Bridge {
+  float white_point;
+  uint32_t encoding;
+  uint32_t curve;
+};
+
 inline bool MakePso(ID3D12Device* device, const unsigned char* dxil, size_t size,
                     ID3D12PipelineState** out) {
   D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
@@ -78,7 +99,7 @@ inline bool MakePso(ID3D12Device* device, const unsigned char* dxil, size_t size
   return SUCCEEDED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(out)));
 }
 
-// Root signature: [0] SRV table t0-t1, [1] UAV table u0, [2] seven root constants b0.
+// Root signature: [0] SRV table t0-t1, [1] UAV table u0, [2] nine root constants b0.
 inline bool Init(ID3D12Device* device) {
   if (c.root_sig != nullptr) return true;
   if (c.failed) return false;
@@ -103,7 +124,7 @@ inline bool Init(ID3D12Device* device) {
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[2].Constants.ShaderRegister = 0;
-  params[2].Constants.Num32BitValues = 7;
+  params[2].Constants.Num32BitValues = kNumConstants;
   params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC desc = {};
@@ -254,15 +275,6 @@ inline void WriteBufferUav(ID3D12Device* device, uint32_t index, ID3D12Resource*
   device->CreateUnorderedAccessView(res, nullptr, &d, SlotAt(index).cpu);
 }
 
-struct Params {
-  float transfer;
-  float max_ratio;
-  float colour;
-  float white_point;
-  uint32_t debug;
-  uint32_t width;
-  uint32_t height;
-};
 
 inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, uint32_t srv_slot,
                      uint32_t uav_slot, const Params& p, uint32_t groups_x, uint32_t groups_y) {
@@ -271,7 +283,7 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
   cmd->SetPipelineState(pso);
   cmd->SetComputeRootDescriptorTable(0, SlotAt(srv_slot).gpu);
   cmd->SetComputeRootDescriptorTable(1, SlotAt(uav_slot).gpu);
-  cmd->SetComputeRoot32BitConstants(2, 7, &p, 0);
+  cmd->SetComputeRoot32BitConstants(2, kNumConstants, &p, 0);
   cmd->Dispatch(groups_x, groups_y, 1);
 }
 
@@ -293,7 +305,7 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 // game_out COPY_SOURCE, colorCopy and proxy NON_PIXEL_SHADER_RESOURCE (ready for the model).
 inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                       ID3D12Resource* color_copy, ID3D12Resource* proxy, uint32_t w, uint32_t h,
-                      uint32_t frame, float white_point) {
+                      uint32_t frame, const Bridge& bridge) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
   if (!Init(device) || !EnsureBuffers(device, w, h)) {
@@ -310,7 +322,7 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
   WriteBufferSrv(device, base + 8, c.tile_buf, c.tile_count, 8);
   WriteBufferUav(device, base + 9, c.result_buf, 1, 4);
 
-  Params p = {0.0f, 0.0f, 0.0f, white_point, 0, w, h};
+  Params p = {0.0f, 0.0f, 0.0f, bridge.white_point, 0, w, h, bridge.encoding, bridge.curve};
 
   Barrier(cmd, game_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   Barrier(cmd, color_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -344,7 +356,7 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
 inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                        ID3D12Resource* color_copy, ID3D12Resource* proxy,
                        ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t frame,
-                       float transfer, float max_ratio, float colour, float white_point,
+                       float transfer, float max_ratio, float colour, const Bridge& bridge,
                        uint32_t debug) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
@@ -358,7 +370,8 @@ inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-  Params p = {transfer, max_ratio, colour, white_point, debug, w, h};
+  Params p = {transfer, max_ratio, colour, bridge.white_point, debug, w, h, bridge.encoding,
+              bridge.curve};
   Dispatch(cmd, c.resolve_pso, base + 4, base + 6, p, (w + 7) / 8, (h + 7) / 8);
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

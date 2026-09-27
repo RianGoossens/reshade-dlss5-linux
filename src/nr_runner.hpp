@@ -101,6 +101,7 @@ constexpr uint32_t kFullLogs = 3;        // first evals logged in full
 constexpr uint32_t kHeartbeatEvery = 600;
 constexpr uint32_t kMaxFailStreak = 3;   // consecutive eval failures before the pass disables itself
 constexpr int kGraveyardFrames = 240;    // frames a retired resource waits before release
+constexpr int kMaxPasses = 4;            // Pass Count ceiling, as in RenoDX
 
 struct Grave {
   ID3D12Resource* resource = nullptr;
@@ -120,8 +121,13 @@ struct State {
 
   NVSDK_NGX_Parameter* caps = nullptr;
   bool snippet_inited = false;
-  void* feature = nullptr;
-  ID3D12Resource* output = nullptr;      // the model's answer
+  void* feature = nullptr;               // pass 1
+  ID3D12Resource* output = nullptr;      // the model's answer (the last pass's output)
+  // Pass Count: every further pass is its own feature (its own temporal history) fed the previous
+  // pass's answer. inter[k] is pass k+1's output and pass k+2's input; all stay in proxy space.
+  void* extra[kMaxPasses - 1] = {};
+  ID3D12Resource* inter[kMaxPasses - 1] = {};
+  int built_passes = 1;                  // the pass count the current features were built for
   ID3D12Resource* color_copy = nullptr;  // the original, copied aside for the resolve
   ID3D12Resource* proxy = nullptr;       // the display-referred picture the model is shown
   DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
@@ -130,13 +136,24 @@ struct State {
   // caps how far the model may move any pixel's luminance either way; colour 0 keeps the game's
   // own hue exactly -- only brightness carries the model's verdict).
   float transfer = 1.0f;
-  float max_ratio = 2.0f;
+  float max_ratio = 4.0f;  // a safety net only; not exposed
   float colour_strength = 0.0f;
 
-  // White point: the measured log-average luminance, EMA-smoothed; -1 until the first reading
-  // lands. wp_scale is the user's paper-white multiplier on top.
+  // Colour bridge, mirroring the RenoDX DLSS5 addon's Encoding and Diffuse White (nits).
+  // encoding: 0 Auto, 1 Linear BT.709, 2 sRGB, 3 BT.2100 PQ, 4 scRGB, 5 scRGB-nl,
+  // 6 Measured (the original fork's auto-exposure white point + Reinhard).
+  int encoding = 0;
+  bool diffuse_white_override = false;
+  float diffuse_white_nits = 100.0f;
+
+  // Measured mode only: the log-average luminance, EMA-smoothed; -1 until the first reading
+  // lands. wp_scale is the user's multiplier on top.
   float wp_ema = -1.0f;
   float wp_scale = 1.0f;
+
+  // What the last frame actually used, for the overlay.
+  int active_encoding = 0;
+  float active_white_point = 0.0f;
 
   // Debug view: 0 off, 1 proxy, 2 model answer, 3 difference x20.
   int debug_view = 0;
@@ -147,9 +164,14 @@ struct State {
   // (LocalStructureStrength), local_tone is the broad local-contrast/tone shaping (LocalToneStrength).
   float intensity = 1.0f;
   float local_structure = 1.0f;
+  float global_tone = 1.0f;
   float local_tone = 1.0f;
+  bool auto_mask = true;
+  float skin_structure = 1.0f;
+  bool ui_correction = true;
   int preset = 0;
   int style = 0;
+  int pass_count = 1;
 
   // Geometry of the game's current DLSS-SR feature.
   unsigned render_w = 0, render_h = 0;
@@ -317,6 +339,11 @@ inline void RetireFeature(const char* why) {
   Bury(s.output, s.feature);
   Bury(s.color_copy, nullptr);
   Bury(s.proxy, nullptr);
+  for (int k = 0; k < kMaxPasses - 1; ++k) {
+    Bury(s.inter[k], s.extra[k]);
+    s.inter[k] = nullptr;
+    s.extra[k] = nullptr;
+  }
   s.feature = nullptr;
   s.output = nullptr;
   s.color_copy = nullptr;
@@ -360,6 +387,12 @@ inline void Shutdown() {
   s.color_copy = nullptr;
   if (s.proxy != nullptr) s.proxy->Release();
   s.proxy = nullptr;
+  for (int k = 0; k < kMaxPasses - 1; ++k) {
+    if (s.inter[k] != nullptr) s.inter[k]->Release();
+    if (s.extra[k] != nullptr && s.release != nullptr) s.release(s.extra[k]);
+    s.inter[k] = nullptr;
+    s.extra[k] = nullptr;
+  }
   for (auto& g : s.graveyard) {
     if (g.resource != nullptr) g.resource->Release();
     if (g.feature != nullptr && s.release != nullptr) s.release(g.feature);
@@ -487,9 +520,68 @@ inline void WriteTuning(void* p) {
   SetFloat(p, "DLSSNR.Intensity", s.intensity);
   SetUInt(p, "DLSSNR.Style", (unsigned)s.style);
   SetFloat(p, "DLSSNR.LocalStructureStrength", s.local_structure);
+  SetFloat(p, "DLSSNR.GlobalToneStrength", s.global_tone);
   SetFloat(p, "DLSSNR.LocalToneStrength", s.local_tone);
-  SetFloat(p, "DLSSNR.SkinStructureStrength", -1.0f);
-  SetUInt(p, "DLSSNR.UseAutoMask", 1u);
+  SetUInt(p, "DLSSNR.UseAutoMask", s.auto_mask ? 1u : 0u);
+  // -1 leaves characters on the global structure strength, as before, when masking is off.
+  SetFloat(p, "DLSSNR.SkinStructureStrength", s.auto_mask ? s.skin_structure : -1.0f);
+  SetUInt(p, "DLSSNR.UICorrection", s.ui_correction ? 1u : 0u);
+}
+
+// --- colour bridge ----------------------------------------------------------
+
+enum Encoding : int {
+  kEncAuto = 0,
+  kEncLinear = 1,
+  kEncSrgb = 2,
+  kEncPq = 3,
+  kEncScrgb = 4,
+  kEncScrgbNl = 5,
+  kEncMeasured = 6,
+};
+
+inline bool IsUnormColorFormat(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Auto, as in RenoDX: native DLSS output is linear BT.709. A UNORM output is not native DLSS
+// output -- it is display-referred SDR (the dlss5-bridge synthetic contract on a D3D11 game), so
+// it is sRGB.
+inline int ResolveEncoding(int requested, DXGI_FORMAT output_format) {
+  if (requested != kEncAuto) return requested;
+  return IsUnormColorFormat(output_format) ? kEncSrgb : kEncLinear;
+}
+
+// RenoDX's automatic diffuse white per encoding.
+inline float AutoDiffuseWhiteNits(int encoding) {
+  switch (encoding) {
+    case kEncPq:
+    case kEncScrgb: return 250.0f;
+    case kEncScrgbNl: return 203.0f;
+    default: return 100.0f;
+  }
+}
+
+// The source-linear value that is diffuse white: 1.0 = 100 nits for linear BT.709 and sRGB,
+// 1.0 = 80 nits for scRGB, nits for PQ.
+inline float DiffuseWhiteToSource(int encoding, float nits) {
+  switch (encoding) {
+    case kEncPq: return nits;
+    case kEncScrgb:
+    case kEncScrgbNl: return nits / 80.0f;
+    default: return nits / 100.0f;
+  }
 }
 
 // Called by the overlay after the create-time model settings changed: the model reads them only
@@ -498,8 +590,70 @@ inline void WriteTuning(void* p) {
 // the retire itself executes at the top of the next OnDlssEvaluated, on the owning thread.
 inline void ApplyModelSettings() { s.retire_pending.store(true, std::memory_order_relaxed); }
 
+// Writes the create-time block and builds one feature; nullptr on failure.
+inline void* CreateOne(ID3D12GraphicsCommandList* cmd, int pass) {
+  void* p = s.caps;
+  SetUInt(p, "DLSSNR.Enabled", 1u);
+  SetUInt(p, "DLSSNR.Width", s.out_w);
+  SetUInt(p, "DLSSNR.Height", s.out_h);
+  SetUInt(p, "CreationNodeMask", 1u);
+  SetUInt(p, "VisibilityNodeMask", 1u);
+  SetUInt(p, "DLSSNR.Hint.Render.Preset", (unsigned)s.preset);
+  WriteTuning(p);
+
+  int create_result = 0;
+  void* feature = s.create(cmd, s.caps, &create_result);
+  ngx_probe::Logf("nr-fwd: CreateFeature(18) pass %d => 0x%x (%s) handle=%p", pass,
+                  (unsigned)create_result, ResultName(create_result), feature);
+  return feature;
+}
+
+// One FP16 display-resolution texture for a pass's intermediate answer.
+inline ID3D12Resource* CreateInter(ID3D12GraphicsCommandList* cmd) {
+  ID3D12Device* device = nullptr;
+  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return nullptr;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = s.out_w;
+  desc.Height = s.out_h;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource* texture = nullptr;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                             IID_PPV_ARGS(&texture))))
+    texture = nullptr;
+  device->Release();
+  return texture;
+}
+
+// The further passes, one create per frame like the first. A pass that cannot be built caps the
+// pass count instead of giving up: the passes already built keep running.
+inline bool EnsureExtraPasses(ID3D12GraphicsCommandList* cmd) {
+  for (int k = 0; k < s.built_passes - 1; ++k) {
+    if (s.extra[k] != nullptr) continue;
+    if (s.inter[k] == nullptr) s.inter[k] = CreateInter(cmd);
+    if (s.inter[k] != nullptr) s.extra[k] = CreateOne(cmd, k + 2);
+    if (s.extra[k] == nullptr) {
+      ngx_probe::Logf("nr-fwd: pass %d could not be built -- running %d pass(es)", k + 2, k + 1);
+      if (s.inter[k] != nullptr) s.inter[k]->Release();
+      s.inter[k] = nullptr;
+      s.built_passes = k + 1;
+      return true;
+    }
+    return false;  // evaluate from the next frame on, as with the first feature
+  }
+  return true;
+}
+
 inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
-  if (s.feature != nullptr) return true;
+  if (s.feature != nullptr) return EnsureExtraPasses(cmd);
 
   if (!s.snippet_inited) {
     wchar_t snippet[MAX_PATH] = {};
@@ -518,21 +672,9 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
     s.snippet_inited = true;
   }
 
-  void* p = s.caps;
-  SetUInt(p, "DLSSNR.Enabled", 1u);
-  SetUInt(p, "DLSSNR.Width", s.out_w);
-  SetUInt(p, "DLSSNR.Height", s.out_h);
-  SetUInt(p, "CreationNodeMask", 1u);
-  SetUInt(p, "VisibilityNodeMask", 1u);
-  SetUInt(p, "DLSSNR.Hint.Render.Preset", (unsigned)s.preset);
-  SetUInt(p, "DLSSNR.UICorrection", 1u);
-  WriteTuning(p);
-
-  int create_result = 0;
-  s.feature = s.create(cmd, s.caps, &create_result);
-  ngx_probe::Logf("nr-fwd: CreateFeature(18) => 0x%x (%s) handle=%p", (unsigned)create_result,
-                  ResultName(create_result), s.feature);
+  s.feature = CreateOne(cmd, 1);
   if (s.feature == nullptr) return GiveUp("feature creation failed");
+  s.built_passes = s.pass_count < 1 ? 1 : (s.pass_count > kMaxPasses ? kMaxPasses : s.pass_count);
   s.feature_w = s.out_w;
   s.feature_h = s.out_h;
   // Evaluate from the next frame on, so the init work this create recorded executes first.
@@ -565,18 +707,33 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
 
   if (!CreateTextures(cmd, color)) return;
 
-  // Fold the latest luminance reading into the smoothed white point. The reading lags a few
-  // frames, which the EMA absorbs; until the first one lands, 1.0 preserves 5b behaviour.
-  const float raw_wp = nr_compose::ReadWhitePoint(s.eval_count);
-  if (raw_wp > 0.0f && raw_wp == raw_wp) {
-    s.wp_ema = (s.wp_ema <= 0.0f) ? raw_wp : s.wp_ema + 0.05f * (raw_wp - s.wp_ema);
+  // The colour bridge for this frame. Measured mode folds the latest luminance reading (a few
+  // frames old, absorbed by the EMA) into the smoothed white point; every other encoding uses a
+  // fixed diffuse white, so nothing about the picture the model sees moves with the scene.
+  const int encoding = ResolveEncoding(s.encoding, s.output_format);
+  nr_compose::Bridge bridge = {};
+  if (encoding == kEncMeasured) {
+    const float raw_wp = nr_compose::ReadWhitePoint(s.eval_count);
+    if (raw_wp > 0.0f && raw_wp == raw_wp) {
+      s.wp_ema = (s.wp_ema <= 0.0f) ? raw_wp : s.wp_ema + 0.05f * (raw_wp - s.wp_ema);
+    }
+    float wp = (s.wp_ema > 0.0f) ? s.wp_ema : 1.0f;
+    bridge.white_point = (wp < 0.01f ? 0.01f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
+    bridge.encoding = kEncLinear;
+    bridge.curve = 1;  // CURVE_REINHARD
+  } else {
+    const float nits =
+        s.diffuse_white_override ? s.diffuse_white_nits : AutoDiffuseWhiteNits(encoding);
+    bridge.white_point = DiffuseWhiteToSource(encoding, nits < 1.0f ? 1.0f : nits);
+    bridge.encoding = (uint32_t)encoding;
+    bridge.curve = 0;  // CURVE_KNEE
   }
-  float wp = (s.wp_ema > 0.0f) ? s.wp_ema : 1.0f;
-  wp = (wp < 0.01f ? 0.01f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
+  s.active_encoding = encoding;
+  s.active_white_point = bridge.white_point;
 
   // Copy the original aside, encode the display-referred proxy, record the measurement.
   if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, s.eval_count,
-                             wp)) {
+                             bridge)) {
     GiveUp("compose pipeline initialisation failed");
     return;
   }
@@ -590,10 +747,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
       (s.create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
 
   void* p = s.caps;
-  SetResource(p, "DLSSNR.Color", s.proxy);
   SetResource(p, "DLSSNR.Depth", depth);
   SetResource(p, "DLSSNR.MVec", motion);
-  SetResource(p, "DLSSNR.Output", s.output);
 
   SetUInt(p, "DLSSNR.Enabled", 1u);
   SetUInt(p, "DLSSNR.Width", s.out_w);
@@ -622,11 +777,33 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   SetFloat(p, "DLSSNR.MVecScaleY", mv_scale_y);
   WriteTuning(p);
 
+  // The pass chain: proxy -> pass 1 -> inter[0] -> pass 2 -> ... -> the last pass -> output.
+  // Each intermediate answer goes to shader-resource state for the next pass to read, and every
+  // one goes back to UNORDERED_ACCESS once the chain is done (or abandoned).
+  const int passes = s.built_passes;
   const uint32_t n = ++s.eval_count;
-  const int result = s.evaluate(cmd, s.feature, s.caps);
+  int result = 1;
+  int ran = 0;
+  for (int k = 0; k < passes && result == 1; ++k) {
+    ID3D12Resource* in = (k == 0) ? s.proxy : s.inter[k - 1];
+    ID3D12Resource* out = (k == passes - 1) ? s.output : s.inter[k];
+    SetResource(p, "DLSSNR.Color", in);
+    SetResource(p, "DLSSNR.Output", out);
+    result = s.evaluate(cmd, k == 0 ? s.feature : s.extra[k - 1], s.caps);
+    ran = k + 1;
+    if (result == 1 && k < passes - 1)
+      nr_compose::Barrier(cmd, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  // Intermediates 0..ran-2 were moved to shader-resource state (the failing pass's own output
+  // never was); put them back.
+  const int moved = (result == 1) ? passes - 1 : ran - 1;
+  for (int k = 0; k < moved; ++k)
+    nr_compose::Barrier(cmd, s.inter[k], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   if (n <= kFullLogs || n % kHeartbeatEvery == 0) {
-    ngx_probe::Logf("nr-fwd: EvaluateFeature #%u => 0x%x (%s)", n, (unsigned)result,
+    ngx_probe::Logf("nr-fwd: EvaluateFeature #%u x%d => 0x%x (%s)", n, ran, (unsigned)result,
                     ResultName(result));
   }
 
@@ -644,7 +821,7 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   // Anchor the model's answer to the original and write the blend into the game's output, which
   // its post-processing reads next.
   nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h,
-                         s.eval_count, s.transfer, s.max_ratio, s.colour_strength, wp,
+                         s.eval_count, s.transfer, s.max_ratio, s.colour_strength, bridge,
                          (uint32_t)s.debug_view);
 }
 

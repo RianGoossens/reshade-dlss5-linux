@@ -15,7 +15,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gindex : 
     float2 sample_value = float2(0.0, 0.0);
     if (id.x < g_width && id.y < g_height)
     {
-        const float l = Luma(max(Src[id.xy], 0.0));
+        const float l = Luma(max(SourceToLinear(Src[id.xy]), 0.0));
         sample_value = float2(log(max(l, 1e-6)), 1.0);
     }
     g_partial[gindex] = sample_value;
