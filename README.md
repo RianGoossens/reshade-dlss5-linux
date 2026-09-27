@@ -109,7 +109,7 @@ page for titles this has been tried in — and please add your own results there
 - addon-dlssnr-linux (NapXDD): NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6 (**X11**
   session, kwin 6.7.3) · Proton.
 - This fork: RTX 5070 Ti Laptop · CachyOS · proton-cachyos-slr. Dark Souls Remastered (D3D11,
-  dlss5-bridge substitute session). High on Life (native D3D12 DLSS) ran on NapXDD's build.
+  dlss5-bridge substitute session) and High on Life (native D3D12 DLSS).
 
 Other RTX 50/40 cards, drivers, and compositors are expected to work but are untested — see NapXDD's [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
 wiki and please report your own setup.
