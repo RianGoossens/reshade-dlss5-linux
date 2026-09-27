@@ -127,11 +127,14 @@ and setups confirmed working.
    PROTON_ENABLE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
    ```
 
-   **GE-Proton / proton-cachyos** (`PROTON_ENABLE_NVAPI` does not exist on these builds):
+   **GE-Proton / proton-cachyos** use `PROTON_FORCE_NVAPI` instead:
 
    ```
    PROTON_FORCE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
    ```
+
+   For a D3D11 game, where ReShade is installed as `d3d11.dll`, override that instead:
+   `WINEDLLOVERRIDES="d3d11=n,b"`.
 
    See NapXDD's [**Launch Options**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Launch-Options)
    wiki page for the full story: what each variable does per Proton build, the
