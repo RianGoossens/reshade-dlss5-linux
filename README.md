@@ -82,8 +82,8 @@ forwarder). Grab them from a [GitHub Release](../../releases) (every version tag
 every push also uploads them as a downloadable CI artifact), or build them yourself (see below —
 `build.sh` copies them straight into the game folder for you).
 
-See NapXDD's [**Tested Games**](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games) wiki
-page for titles this has been tried in — and please add your own results there.
+See the [**Tested Games**](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page for games confirmed working, with the settings each
+one needs.
 
 ### Prerequisites
 
@@ -104,15 +104,8 @@ page for titles this has been tried in — and please add your own results there
   model's version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`)
   and warns when it isn't the tested build.
 
-**Tested environments:**
-
-- addon-dlssnr-linux (NapXDD): NVIDIA GeForce RTX 5070 · Linux driver **610.57.04** · Fedora · KDE Plasma 6 (**X11**
-  session, kwin 6.7.3) · Proton.
-- This fork: RTX 5070 Ti Laptop · CachyOS · proton-cachyos-slr. Dark Souls Remastered (D3D11,
-  dlss5-bridge substitute session) and High on Life (native D3D12 DLSS).
-
-Other RTX 50/40 cards, drivers, and compositors are expected to work but are untested — see NapXDD's [Tested Games](https://github.com/NapXDD/addon-dlssnr-linux/wiki/Tested-Games)
-wiki and please report your own setup.
+Tested on RTX 50-series cards under Proton. The [Tested Games](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page lists the games
+and setups confirmed working.
 
 > **First, make sure the game itself runs on Proton.** Check
 > [ProtonDB](https://www.protondb.com/) for the game's rating before trying this add-on — if the
@@ -171,8 +164,7 @@ With the default `unwrap=1`, the bridge delivers no frames to this add-on under 
 ### D3D11 or Vulkan games with DLSS
 
 The bridge mirrors the game's own DLSS onto its D3D12 session automatically. Turn DLSS on in the
-game. *Encoding → Auto* picks the right decode for the bridge's output. This route hasn't been
-tested with this add-on yet; reports welcome.
+game. *Encoding → Auto* picks the right decode for the bridge's output.
 
 ### Games without any DLSS
 
@@ -207,8 +199,7 @@ The bridge can build a substitute DLAA session from the frame, ReShade's depth, 
    only enabled effects load, and the bridge reports no depth buffer even when Generic Depth has
    the right one selected.
 
-Tested under Proton with Dark Souls Remastered (D3D11). The substitute is a real DLSS session fed
-approximated inputs, so text can soften and dense
+The substitute is a real DLSS session fed approximated inputs, so text can soften and dense
 foliage can smear a little.
 
 ## Building
