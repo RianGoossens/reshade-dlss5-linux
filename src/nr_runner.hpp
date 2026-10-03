@@ -173,10 +173,40 @@ struct State {
   int style = 0;
   int pass_count = 1;
 
-  // Geometry of the game's current DLSS-SR feature.
+  // Geometry the pass runs at: the game's DLSS-SR feature, or the back buffer in standalone mode.
   unsigned render_w = 0, render_h = 0;
   unsigned out_w = 0, out_h = 0;
   int create_flags = 0;
+  // The game's DLSS-SR geometry as last created, kept apart so a switch back from standalone
+  // restores it.
+  unsigned dlss_render_w = 0, dlss_render_h = 0;
+  unsigned dlss_out_w = 0, dlss_out_h = 0;
+  int dlss_create_flags = 0;
+
+  // Where the frame comes from. Standalone runs off the back buffer, ReShade's depth and a
+  // motion-vector effect, for a D3D12 game with no DLSS session to hook.
+  int source = 0;                  // Source
+  ULONGLONG last_dlss_tick = 0;    // last DLSS-SR evaluate seen (GetTickCount64)
+  int standalone_mode = 0;         // 0 Auto, 1 Always, 2 Off
+  bool sa_flip_x = false, sa_flip_y = false;  // motion-vector direction, standalone only
+  bool temporal = true;            // false resets the model's history every frame (diagnostic)
+  ID3D12Resource* sa_frame = nullptr;  // UAV-capable copy of the back buffer
+  DXGI_FORMAT sa_format = DXGI_FORMAT_UNKNOWN;
+  HMODULE ngx_core = nullptr;      // _nvngx.dll, when standalone had to start NGX itself
+  // Standalone records on its own command list, made from ReShade's proxy device (the device
+  // every resource's GetDevice hands out), and runs it on its own queue between ReShade's work
+  // and the present. ReShade's own list is unwrapped; mixing the two crashes the model's driver
+  // calls, because ReShade rewrites descriptor handles for heaps made through the proxy.
+  ID3D12CommandQueue* sa_queue = nullptr;
+  ID3D12CommandAllocator* sa_alloc[3] = {};
+  ID3D12GraphicsCommandList* sa_list = nullptr;
+  ID3D12Fence* sa_fence_in = nullptr;   // game queue -> ours
+  ID3D12Fence* sa_fence_out = nullptr;  // ours -> game queue
+  UINT64 sa_value = 0;
+  UINT64 sa_alloc_value[3] = {};
+  HANDLE sa_event = nullptr;
+  bool sa_pending = false;              // a recorded list is waiting for SubmitStandalone
+  char sa_status[160] = "";        // why standalone is or is not running, for the overlay
   // Geometry the NR feature was built against; a mismatch retires it.
   unsigned feature_w = 0, feature_h = 0;
 
@@ -192,6 +222,9 @@ struct State {
 };
 
 inline State s;
+
+enum Source : int { kSrcNone = 0, kSrcDlss = 1, kSrcStandalone = 2 };
+enum StandaloneMode : int { kSaAuto = 0, kSaAlways = 1, kSaOff = 2 };
 
 inline const char* ResultName(int r) {
   switch ((unsigned)r) {
@@ -350,11 +383,20 @@ inline void RetireFeature(const char* why) {
   s.proxy = nullptr;
   s.output_format = DXGI_FORMAT_UNKNOWN;
   s.feature_w = s.feature_h = 0;
+  Bury(s.sa_frame, nullptr);
+  s.sa_frame = nullptr;
+  s.sa_format = DXGI_FORMAT_UNKNOWN;
 }
 
 // Remember the game's DLSS-SR geometry; the NR feature is built against the display resolution and
 // its guides against the render resolution.
 inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int flags) {
+  s.dlss_render_w = w;
+  s.dlss_render_h = h;
+  s.dlss_out_w = ow;
+  s.dlss_out_h = oh;
+  s.dlss_create_flags = flags;
+  if (s.source == kSrcStandalone) return;  // applied when the DLSS source takes over
   s.render_w = w;
   s.render_h = h;
   s.out_w = ow;
@@ -387,6 +429,26 @@ inline void Shutdown() {
   s.color_copy = nullptr;
   if (s.proxy != nullptr) s.proxy->Release();
   s.proxy = nullptr;
+  if (s.sa_frame != nullptr) s.sa_frame->Release();
+  s.sa_frame = nullptr;
+  if (s.sa_fence_out != nullptr && s.sa_event != nullptr &&
+      s.sa_fence_out->GetCompletedValue() < s.sa_value) {
+    s.sa_fence_out->SetEventOnCompletion(s.sa_value, s.sa_event);
+    WaitForSingleObject(s.sa_event, 2000);
+  }
+  if (s.sa_list != nullptr) s.sa_list->Release();
+  for (auto& a : s.sa_alloc) {
+    if (a != nullptr) a->Release();
+    a = nullptr;
+  }
+  if (s.sa_queue != nullptr) s.sa_queue->Release();
+  if (s.sa_fence_in != nullptr) s.sa_fence_in->Release();
+  if (s.sa_fence_out != nullptr) s.sa_fence_out->Release();
+  if (s.sa_event != nullptr) CloseHandle(s.sa_event);
+  s.sa_list = nullptr;
+  s.sa_queue = nullptr;
+  s.sa_fence_in = s.sa_fence_out = nullptr;
+  s.sa_event = nullptr;
   for (int k = 0; k < kMaxPasses - 1; ++k) {
     if (s.inter[k] != nullptr) s.inter[k]->Release();
     if (s.extra[k] != nullptr && s.release != nullptr) s.release(s.extra[k]);
@@ -412,19 +474,23 @@ inline bool IsEnabled() { return s.enabled; }
 
 // --- setup ---------------------------------------------------------------
 
+// Everything lives beside the game exe: the forwarder, the model, and our data path.
+inline bool ResolveGameDir() {
+  if (s.game_dir[0] != 0) return true;
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  wchar_t* slash = wcsrchr(exe, L'\\');
+  if (slash == nullptr) return false;
+  *slash = 0;
+  wcscpy_s(s.game_dir, exe);
+  return true;
+}
+
 inline bool EnsureSetup(ID3D12GraphicsCommandList* cmd) {
   if (s.caps != nullptr && s.forwarder != nullptr) return true;
   NR_TEST_HOOKS_INIT();
 
-  // Everything lives beside the game exe: the forwarder, the model, and our data path.
-  if (s.game_dir[0] == 0) {
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    wchar_t* slash = wcsrchr(exe, L'\\');
-    if (slash == nullptr) return GiveUp("could not resolve the game directory");
-    *slash = 0;
-    wcscpy_s(s.game_dir, exe);
-  }
+  if (!ResolveGameDir()) return GiveUp("could not resolve the game directory");
 
   if (s.forwarder == nullptr) {
     wchar_t path[MAX_PATH] = {};
@@ -694,15 +760,21 @@ inline void AbortAfterPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_o
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
-inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
-  // The game's DLSS output is the frame; the model sees its encoded proxy, and the game's DLSS
-  // guides are the model's guides.
+// One frame's inputs: the frame (UAV-capable, read and written in place), and the guides.
+struct Inputs {
   ID3D12Resource* color = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* motion = nullptr;
-  game_params->Get(NVSDK_NGX_Parameter_Output, &color);
-  game_params->Get(NVSDK_NGX_Parameter_Depth, &depth);
-  game_params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion);
+  float mv_scale_x = 1.0f, mv_scale_y = 1.0f;
+  bool reset = false;
+  bool depth_inverted = false;
+  unsigned depth_w = 0, depth_h = 0;  // the depth region actually rendered; 0 = render size
+};
+
+inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
+  ID3D12Resource* color = in.color;
+  ID3D12Resource* depth = in.depth;
+  ID3D12Resource* motion = in.motion;
   if (color == nullptr || depth == nullptr || motion == nullptr) return;
 
   if (!CreateTextures(cmd, color)) return;
@@ -738,13 +810,9 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
     return;
   }
 
-  float mv_scale_x = 1.0f, mv_scale_y = 1.0f;
-  game_params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &mv_scale_x);
-  game_params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mv_scale_y);
-  int reset = 0;
-  game_params->Get(NVSDK_NGX_Parameter_Reset, &reset);
-  const bool depth_inverted =
-      (s.create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+  const float mv_scale_x = in.mv_scale_x, mv_scale_y = in.mv_scale_y;
+  const int reset = (in.reset || !s.temporal) ? 1 : 0;
+  const bool depth_inverted = in.depth_inverted;
 
   void* p = s.caps;
   SetResource(p, "DLSSNR.Depth", depth);
@@ -766,8 +834,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   SetUInt(p, "DLSSNR.OutputSubrectHeight", s.out_h);
   SetUInt(p, "DLSSNR.DepthSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.DepthSubrectBaseY", 0u);
-  SetUInt(p, "DLSSNR.DepthSubrectWidth", s.render_w);
-  SetUInt(p, "DLSSNR.DepthSubrectHeight", s.render_h);
+  SetUInt(p, "DLSSNR.DepthSubrectWidth", in.depth_w != 0 ? in.depth_w : s.render_w);
+  SetUInt(p, "DLSSNR.DepthSubrectHeight", in.depth_h != 0 ? in.depth_h : s.render_h);
   SetUInt(p, "DLSSNR.MVecSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.MVecSubrectBaseY", 0u);
   SetUInt(p, "DLSSNR.MVecSubrectWidth", s.render_w);
@@ -822,24 +890,298 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   // its post-processing reads next.
   nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h,
                          s.eval_count, s.transfer, s.max_ratio, s.colour_strength, bridge,
-                         (uint32_t)s.debug_view);
+                         (uint32_t)s.debug_view, motion, mv_scale_x, mv_scale_y, depth);
 }
 
 // Called after every successful game DLSS-SR evaluate, on the game's own command list.
 inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
   if (s.gave_up || cmd == nullptr || game_params == nullptr) return;
-  if (s.out_w == 0 || s.out_h == 0) return;  // no DLSS-SR create seen yet
+  if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return;  // no DLSS-SR create seen yet
+  s.last_dlss_tick = GetTickCount64();  // even while disabled: standalone must stay out
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))
     RetireFeature("model settings changed");
   if (!s.enabled) return;
 
+  if (s.source != kSrcDlss) {
+    if (s.source == kSrcStandalone) RetireFeature("the game's DLSS took over from standalone");
+    s.source = kSrcDlss;
+    s.render_w = s.dlss_render_w;
+    s.render_h = s.dlss_render_h;
+    s.out_w = s.dlss_out_w;
+    s.out_h = s.dlss_out_h;
+    s.create_flags = s.dlss_create_flags;
+    ngx_probe::Log("nr-fwd: source = the game's DLSS session");
+  }
+
   if (!EnsureSetup(cmd)) return;
   if (!EnsureFeature(cmd)) return;
-  Evaluate(cmd, game_params);
+
+  // The game's DLSS output is the frame; the model sees its encoded proxy, and the game's DLSS
+  // guides are the model's guides.
+  Inputs in;
+  game_params->Get(NVSDK_NGX_Parameter_Output, &in.color);
+  game_params->Get(NVSDK_NGX_Parameter_Depth, &in.depth);
+  game_params->Get(NVSDK_NGX_Parameter_MotionVectors, &in.motion);
+  game_params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &in.mv_scale_x);
+  game_params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &in.mv_scale_y);
+  int reset = 0;
+  game_params->Get(NVSDK_NGX_Parameter_Reset, &reset);
+  in.reset = reset != 0;
+  in.depth_inverted = (s.create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+  Evaluate(cmd, in);
 
   NR_TEST_HOOK_AFTER_EVALUATE();
 }
 
+// --- standalone source ------------------------------------------------------
+//
+// A D3D12 game with no DLSS has no session to hook, so the frame comes from ReShade instead: the
+// back buffer, ReShade's depth (Generic Depth) and a motion-vector effect's texture (iMMERSE
+// Launchpad). The addon then has to start NGX itself, which a DLSS game's own init does otherwise.
+
+constexpr ULONGLONG kDlssQuietMs = 3000;      // DLSS evaluates this recent keep standalone out
+constexpr ULONGLONG kStandaloneArmMs = 10000;  // Auto waits this long for a DLSS session first
+
+using PFN_D3D12InitExt = int(__cdecl*)(unsigned long long, const wchar_t*, ID3D12Device*, int,
+                                       const NVSDK_NGX_Parameter*);
+
+// NVIDIA's sample application id: a game without DLSS has none of its own.
+constexpr unsigned long long kStandaloneAppId = 231313132ull;
+
+inline bool EnsureNgxCore(ID3D12GraphicsCommandList* cmd) {
+  if (s.ngx_core != nullptr) return true;
+  if (!ResolveGameDir()) return GiveUp("could not resolve the game directory");
+  HMODULE core = GetModuleHandleA("_nvngx.dll");
+  if (core == nullptr) core = LoadLibraryW(L"_nvngx.dll");
+  if (core == nullptr) return GiveUp("standalone: _nvngx.dll could not be loaded (NVAPI off?)");
+  auto init = (PFN_D3D12InitExt)GetProcAddress(core, "NVSDK_NGX_D3D12_Init_Ext");
+  if (init == nullptr) return GiveUp("standalone: NVSDK_NGX_D3D12_Init_Ext not exported");
+  ID3D12Device* device = nullptr;
+  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    return GiveUp("standalone: could not reach the device");
+  const int r = init(kStandaloneAppId, s.game_dir, device, (int)NVSDK_NGX_Version_API, nullptr);
+  device->Release();
+  ngx_probe::Logf("nr-fwd: standalone NGX core init => 0x%x (%s)", (unsigned)r, ResultName(r));
+  if (r != 1) return GiveUp("standalone: NGX core init failed");
+  s.ngx_core = core;
+  return true;
+}
+
+// The UAV-capable twin of a back-buffer format: same copy family, no sRGB view.
+inline DXGI_FORMAT UavTwin(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return f;
+  }
+}
+
+inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back_buffer) {
+  const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
+  const DXGI_FORMAT format = UavTwin(bb.Format);
+  if (s.sa_frame != nullptr && s.sa_format == format && s.out_w == (unsigned)bb.Width &&
+      s.out_h == bb.Height)
+    return true;
+  if (s.feature != nullptr) RetireFeature("standalone frame changed size or format");
+  s.out_w = s.render_w = (unsigned)bb.Width;
+  s.out_h = s.render_h = bb.Height;
+  s.create_flags = 0;
+
+  ID3D12Device* device = nullptr;
+  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = bb.Width;
+  desc.Height = bb.Height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                     nullptr, IID_PPV_ARGS(&s.sa_frame));
+  device->Release();
+  if (FAILED(hr)) {
+    s.sa_frame = nullptr;
+    ngx_probe::Logf("nr-fwd: standalone frame texture (%ux%u format %u) failed: 0x%08x",
+                    s.out_w, s.out_h, (unsigned)format, (unsigned)hr);
+    return false;
+  }
+  s.sa_format = format;
+  ngx_probe::Logf("nr-fwd: standalone frame %ux%u format=%u (back buffer format %u)", s.out_w,
+                  s.out_h, (unsigned)format, (unsigned)bb.Format);
+  return true;
+}
+
+// Whether standalone may run now, with the reason kept for the overlay.
+inline bool StandaloneAllowed() {
+  static const ULONGLONG start = GetTickCount64();
+  const ULONGLONG now = GetTickCount64();
+  if (s.standalone_mode == kSaOff) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "off");
+    return false;
+  }
+  if (s.last_dlss_tick != 0 && now - s.last_dlss_tick < kDlssQuietMs) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a DLSS session is the source");
+    return false;
+  }
+  if (s.standalone_mode == kSaAuto) {
+    // nvngx_dlss.dll resident before standalone started NGX means the game loaded it; after
+    // that, standalone's own NGX init may have loaded it, so it says nothing.
+    if (s.last_dlss_tick != 0 ||
+        (s.ngx_core == nullptr && GetModuleHandleA("nvngx_dlss.dll") != nullptr)) {
+      std::snprintf(s.sa_status, sizeof(s.sa_status),
+                    "standing by: this game has DLSS (set Standalone to Always to force it)");
+      return false;
+    }
+    if (now - start < kStandaloneArmMs) {
+      std::snprintf(s.sa_status, sizeof(s.sa_status), "waiting for a DLSS session first");
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool EnsureStandaloneQueue(ID3D12Resource* back_buffer) {
+  if (s.sa_list != nullptr) return true;
+  ID3D12Device* device = nullptr;  // the proxy: ReShade's hooked GetDevice returns it
+  if (FAILED(back_buffer->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    return GiveUp("standalone: could not reach the device");
+  D3D12_COMMAND_QUEUE_DESC qd = {};
+  qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  bool ok = SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.sa_queue)));
+  for (auto& a : s.sa_alloc)
+    ok = ok && SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                        IID_PPV_ARGS(&a)));
+  ok = ok && SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.sa_alloc[0],
+                                                 nullptr, IID_PPV_ARGS(&s.sa_list)));
+  ok = ok && SUCCEEDED(s.sa_list->Close());
+  ok = ok && SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.sa_fence_in)));
+  ok = ok && SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.sa_fence_out)));
+  device->Release();
+  s.sa_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!ok || s.sa_event == nullptr) return GiveUp("standalone: queue/list/fence creation failed");
+  ngx_probe::Log("nr-fwd: standalone queue ready (proxy device)");
+  return true;
+}
+
+// Called by the addon right after the motion-vector effect rendered: the back buffer is a render
+// target, the depth and motion textures are shader resources. Records the pass on the standalone
+// list; the addon then flushes ReShade's own list and calls SubmitStandalone, which orders this
+// list after everything ReShade recorded so far and before anything it records next.
+inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth,
+                              ID3D12Resource* motion, bool depth_inverted, float depth_scale_x,
+                              float depth_scale_y) {
+  if (s.gave_up || back_buffer == nullptr) return false;
+  if (!StandaloneAllowed()) return false;
+  if (depth == nullptr || motion == nullptr) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "waiting: %s",
+                  depth == nullptr ? "no depth buffer bound (Generic Depth)"
+                                   : "no motion vectors (enable iMMERSE Launchpad)");
+    return false;
+  }
+  const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
+  const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+  if (dd.Width != bb.Width || dd.Height != bb.Height) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status),
+                  "waiting: depth is %llux%u, the screen %llux%u -- pick the screen-sized buffer",
+                  (unsigned long long)dd.Width, dd.Height, (unsigned long long)bb.Width,
+                  bb.Height);
+    return false;
+  }
+
+  TickGraveyard();
+  if (s.retire_pending.exchange(false, std::memory_order_relaxed))
+    RetireFeature("model settings changed");
+  if (!s.enabled) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "paused (F10)");
+    return false;
+  }
+
+  if (s.source != kSrcStandalone) {
+    if (s.source == kSrcDlss) RetireFeature("switching to standalone");
+    s.source = kSrcStandalone;
+    ngx_probe::Log("nr-fwd: source = standalone (back buffer + ReShade depth + motion vectors)");
+  }
+
+  if (!EnsureStandaloneQueue(back_buffer)) return false;
+
+  // Reuse the allocator three frames back once the GPU is past it.
+  const int slot = (int)(s.sa_value % 3);
+  if (s.sa_fence_out->GetCompletedValue() < s.sa_alloc_value[slot]) {
+    s.sa_fence_out->SetEventOnCompletion(s.sa_alloc_value[slot], s.sa_event);
+    WaitForSingleObject(s.sa_event, 1000);
+  }
+  s.sa_alloc[slot]->Reset();
+  ID3D12GraphicsCommandList* cmd = s.sa_list;
+  cmd->Reset(s.sa_alloc[slot], nullptr);
+  s.sa_pending = true;  // from here on the list is submitted, even if the pass bails out
+
+  if (!EnsureNgxCore(cmd)) return true;
+  if (!EnsureStandaloneFrame(cmd, back_buffer)) return true;
+  if (!EnsureSetup(cmd)) return true;
+  if (!EnsureFeature(cmd)) return true;  // created this frame; it recorded init work
+
+  using nr_compose::Barrier;
+  // Back buffer -> the UAV-capable frame copy the pass works on in place.
+  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  cmd->CopyResource(s.sa_frame, back_buffer);
+  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+  // Launchpad's motion vectors are in UV units; NGX scales them to pixels.
+  Inputs in;
+  in.color = s.sa_frame;
+  in.depth = depth;
+  in.motion = motion;
+  in.mv_scale_x = (float)s.out_w * (s.sa_flip_x ? -1.0f : 1.0f);
+  in.mv_scale_y = (float)s.out_h * (s.sa_flip_y ? -1.0f : 1.0f);
+  in.depth_inverted = depth_inverted;
+  // A game rendering below output resolution (FSR, TSR, a resolution scale) draws depth into the
+  // top-left of a screen-sized buffer; ReShade's RESHADE_DEPTH_INPUT_*_SCALE describe that, and
+  // the model gets the same region.
+  if (depth_scale_x > 1.0f) in.depth_w = (unsigned)((float)s.out_w / depth_scale_x + 0.5f);
+  if (depth_scale_y > 1.0f) in.depth_h = (unsigned)((float)s.out_h / depth_scale_y + 0.5f);
+  Evaluate(cmd, in);
+
+  // The result (or, if the pass bailed out, the untouched copy) goes back to the back buffer.
+  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  cmd->CopyResource(back_buffer, s.sa_frame);
+  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  std::snprintf(s.sa_status, sizeof(s.sa_status), "running, %ux%u", s.out_w, s.out_h);
+  return true;
+}
+
+// Runs the recorded list between ReShade's flushed work and whatever the game queue does next.
+inline void SubmitStandalone(ID3D12CommandQueue* game_queue) {
+  if (!s.sa_pending) return;
+  s.sa_pending = false;
+  if (FAILED(s.sa_list->Close())) {
+    GiveUp("standalone: command list failed to close");
+    return;
+  }
+  const UINT64 v = ++s.sa_value;
+  s.sa_alloc_value[(v - 1) % 3] = v;
+  game_queue->Signal(s.sa_fence_in, v);
+  s.sa_queue->Wait(s.sa_fence_in, v);
+  ID3D12CommandList* lists[] = {s.sa_list};
+  s.sa_queue->ExecuteCommandLists(1, lists);
+  s.sa_queue->Signal(s.sa_fence_out, v);
+  game_queue->Wait(s.sa_fence_out, v);
+}
+
 }  // namespace nr_runner
+

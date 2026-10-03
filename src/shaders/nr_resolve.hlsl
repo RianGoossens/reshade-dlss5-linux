@@ -9,7 +9,8 @@
 //
 // Debug views write into the frame directly (they pass through the game's post-processing, so they
 // are for judging the pass, not for pixel-exact readings): 1 = what the model is shown, 2 = its raw
-// answer, 3 = what it changed, amplified twenty times -- flat black means nothing.
+// answer, 3 = what it changed, amplified twenty times -- flat black means nothing, 4 = the motion
+// vectors the model is given.
 #include "nr_common.hlsli"
 
 Texture2D<float3> Orig : register(t0);
@@ -35,6 +36,24 @@ void main(uint3 id : SV_DispatchThreadID)
     if (g_debug == 2)
     {
         Out[id.xy] = LinearToSource(SrgbToLinear(clamp(answer, 0.0, 1.0)));
+        return;
+    }
+    if (g_debug == 4)
+    {
+        // Motion vectors as the model gets them, in pixels per frame: red = horizontal,
+        // green = vertical, log scale up to 16 px. Blue is the depth the model gets, as a check
+        // that the guides are read at all.
+        uint mw, mh;
+        Model.GetDimensions(mw, mh);
+        const uint2 mid = uint2(id.x * mw / g_width, id.y * mh / g_height);
+        const float2 px = Model[mid].xy * float2(g_max_ratio, g_colour);
+        uint dw, dh;
+        Orig.GetDimensions(dw, dh);
+        const float d = Orig[uint2(id.x * dw / g_width, id.y * dh / g_height)].x;
+        // Blue: raw depth, dimmed so motion stays readable on top of it.
+        // Log scale, as Launchpad's own view: a tenth of a pixel already shows.
+        const float2 v = saturate(log(1.0 + abs(px) * 4.0) / log(1.0 + 4.0 * 16.0));
+        Out[id.xy] = LinearToSource(SrgbToLinear(float3(v, d * 0.5)));
         return;
     }
     if (g_debug == 3)

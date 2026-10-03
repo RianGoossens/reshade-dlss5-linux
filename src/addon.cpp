@@ -7,6 +7,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #pragma comment(lib, "user32")  // GetAsyncKeyState for the F10 toggle
 
@@ -83,6 +85,102 @@ void OnPresent(reshade::api::command_queue*, reshade::api::swapchain*,
   f10_was_down = f10_down;
 }
 
+// --- standalone source --------------------------------------------------------
+// A D3D12 game without DLSS: run the pass right after the motion-vector effect (iMMERSE
+// Launchpad) has rendered, when its texture is current and Generic Depth still has the depth
+// buffer in shader-resource state (it reverts that at reshade_finish_effects).
+
+constexpr const char* kDepthNames[] = {"DepthInputTex", "DepthBufferTex", "DepthTex"};
+constexpr char kMotionName[] = "MotionVectorsTex";
+
+ID3D12Resource* TextureResource(reshade::api::effect_runtime* runtime,
+                                reshade::api::effect_texture_variable var) {
+  if (var.handle == 0) return nullptr;
+  reshade::api::resource_view srv = {}, srv_srgb = {};
+  runtime->get_texture_binding(var, &srv, &srv_srgb);
+  if (srv.handle == 0) return nullptr;
+  const auto res = runtime->get_device()->get_resource_from_view(srv);
+  return reinterpret_cast<ID3D12Resource*>(res.handle);
+}
+
+// A global preprocessor definition as a number; 1 when unset or unreadable.
+float PreprocessorFloat(reshade::api::effect_runtime* runtime, const char* name) {
+  char value[32] = {};
+  if (!runtime->get_preprocessor_definition(name, value)) return 1.0f;
+  const float v = std::strtof(value, nullptr);
+  return v > 0.0f ? v : 1.0f;
+}
+
+// Launchpad computes optical flow only when an effect asks for it: requests are bits in a 1x1
+// texture it clears at the end of its own technique, and effects after it set theirs for the next
+// frame. Right after Launchpad that texture is all zero, so setting the optical-flow bit (blue) is
+// a clear that keeps every later effect's own request intact.
+void RequestLaunchpadMotion(reshade::api::effect_runtime* runtime,
+                            reshade::api::command_list* cmd_list, const char* effect) {
+  using namespace reshade::api;
+  static resource requested = {0};
+  static resource_view rtv = {0};
+  device* dev = runtime->get_device();
+  reshade::api::resource_view srv = {}, srv_srgb = {};
+  const effect_texture_variable var = runtime->find_texture_variable(effect, "PredicationBuffer");
+  if (var.handle == 0) return;
+  runtime->get_texture_binding(var, &srv, &srv_srgb);
+  if (srv.handle == 0) return;
+  const resource res = dev->get_resource_from_view(srv);
+  if (res.handle == 0) return;
+  if (res.handle != requested.handle) {
+    if (rtv.handle != 0) dev->destroy_resource_view(rtv);
+    rtv = {0};
+    requested = res;
+    const format f = format_to_default_typed(dev->get_resource_desc(res).texture.format);
+    if (!dev->create_resource_view(res, resource_usage::render_target, resource_view_desc(f), &rtv))
+      rtv = {0};
+  }
+  if (rtv.handle == 0) return;
+  const float request[4] = {0.0f, 0.0f, 1.0f, 0.0f};  // MARTYSMODS_IPC_FEATURE_OPTICALFLOW
+  cmd_list->barrier(res, resource_usage::shader_resource, resource_usage::render_target);
+  cmd_list->clear_render_target_view(rtv, request);
+  cmd_list->barrier(res, resource_usage::render_target, resource_usage::shader_resource);
+}
+
+void OnRenderTechnique(reshade::api::effect_runtime* runtime,
+                       reshade::api::effect_technique technique,
+                       reshade::api::command_list* cmd_list, reshade::api::resource_view rtv,
+                       reshade::api::resource_view) {
+  char name[128] = {};
+  runtime->get_technique_name(technique, name);
+  if (std::strstr(name, "Launchpad") == nullptr) return;
+  char effect[256] = {};
+  runtime->get_technique_effect_name(technique, effect);
+  RequestLaunchpadMotion(runtime, cmd_list, effect);  // every API: the bridge reads it too
+  if (runtime->get_device()->get_api() != reshade::api::device_api::d3d12) return;
+
+  ID3D12Resource* motion = TextureResource(runtime, runtime->find_texture_variable(effect, kMotionName));
+  ID3D12Resource* depth = nullptr;
+  for (const char* depth_name : kDepthNames) {
+    depth = TextureResource(runtime, runtime->find_texture_variable(effect, depth_name));
+    if (depth != nullptr) break;
+  }
+
+  char reversed[8] = {};
+  const bool depth_inverted =
+      runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) &&
+      reversed[0] == '1';
+  const float scale_x = PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE");
+  const float scale_y = PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE");
+
+  auto* back_buffer =
+      reinterpret_cast<ID3D12Resource*>(runtime->get_device()->get_resource_from_view(rtv).handle);
+  if (nr_runner::OnStandaloneFrame(back_buffer, depth, motion, depth_inverted, scale_x,
+                                   scale_y)) {
+    // The pass is on its own list: send everything ReShade recorded so far (the motion vectors
+    // included) to the game queue first, then slot the pass in behind it.
+    auto* queue = runtime->get_command_queue();
+    queue->flush_immediate_command_list();
+    nr_runner::SubmitStandalone(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+  }
+}
+
 // --- settings persistence -------------------------------------------------
 // The tuning lives in ReShade's own config (ReShade.ini beside the game exe),
 // so it survives a game restart. Loaded once at attach — early enough, since
@@ -108,6 +206,7 @@ void LoadSettings() {
 
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
+  reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -145,6 +244,7 @@ void LoadSettings() {
   if (s.encoding < 0 || s.encoding > nr_runner::kEncMeasured) s.encoding = 0;
   if (s.preset < 0 || s.preset > 7) s.preset = 0;
   if (s.pass_count < 1 || s.pass_count > nr_runner::kMaxPasses) s.pass_count = 1;
+  if (s.standalone_mode < 0 || s.standalone_mode > nr_runner::kSaOff) s.standalone_mode = 0;
   if (s.style < 0 || s.style > 2) s.style = 0;
 }
 
@@ -152,6 +252,7 @@ void SaveSettings() {
   auto& s = nr_runner::s;
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
+  reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -257,6 +358,27 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   Edit model;  // create-time model settings: a release rebuilds the feature
   Edit bridge;  // colour bridge and compose: live
 
+  {
+    const char* source = s.source == nr_runner::kSrcDlss         ? "the game's DLSS session"
+                         : s.source == nr_runner::kSrcStandalone ? "standalone"
+                                                                 : "waiting for a frame";
+    ImGui::Text("Source: %s", source);
+    bridge |= Combo("Standalone##mode", &s.standalone_mode, "Auto\0Always\0Off\0", 0,
+                    "For D3D12 games without DLSS: run off the back buffer, ReShade's depth "
+                    "(Generic Depth) and iMMERSE Launchpad's motion vectors, with no bridge.\n"
+                    "Auto runs it only when the game has no DLSS of its own.");
+    if (s.sa_status[0] != 0 && s.source != nr_runner::kSrcDlss)
+      ImGui::TextDisabled("Standalone: %s", s.sa_status);
+    if (s.source == nr_runner::kSrcStandalone) {
+      ImGui::Checkbox("Flip motion X", &s.sa_flip_x);
+      Tip("Reverses the motion vectors' horizontal direction. Try it if moving things drag or "
+          "double up sideways.");
+      ImGui::SameLine();
+      ImGui::Checkbox("Flip motion Y", &s.sa_flip_y);
+      Tip("Reverses the motion vectors' vertical direction.");
+    }
+  }
+
   if (ImGui::CollapsingHeader("Neural Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
     if (s.style > 2) s.style = 2;
     model |= Combo("Style", &s.style, "Model A\0Model B\0Model C\0", 0,
@@ -340,8 +462,12 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     bridge |= Slider("Colour strength", &s.colour_strength, 0.0f, 1.0f, "%.2f", 0.0f,
                      "0 keeps the game's own hue exactly; only brightness carries the model's "
                      "verdict. 1 takes the model's colour too.");
+    ImGui::Checkbox("Temporal history", &s.temporal);
+    Tip("Off resets the model's history every frame: no ghosting or drag from motion vectors, "
+        "but less stable detail. A diagnostic: if drag disappears with this off, the motion "
+        "vectors are the cause.");
     ImGui::Combo("Debug view", &s.debug_view,
-                 "Off\0What the model sees\0Model answer\0Difference x20\0");
+                 "Off\0What the model sees\0Model answer\0Difference x20\0Motion vectors\0");
   }
 
   if (model.committed) nr_runner::ApplyModelSettings();
@@ -365,6 +491,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       LoadSettings();
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::register_overlay("DLSSNR Linux", OnDrawOverlay);
       ngx_probe::TryInstall();  // in case NGX is already resident
       break;
@@ -379,6 +506,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       ngx_probe::Uninstall();
       nr_runner::Shutdown();
       reshade::unregister_overlay("DLSSNR Linux", OnDrawOverlay);
+      reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_addon(h_module);

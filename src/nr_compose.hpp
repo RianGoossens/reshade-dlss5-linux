@@ -247,6 +247,43 @@ inline void WriteSrv(ID3D12Device* device, uint32_t index, ID3D12Resource* res) 
   device->CreateShaderResourceView(res, &d, SlotAt(index).cpu);
 }
 
+// A motion-vector texture's SRV format: typeless storage gets its float view.
+inline DXGI_FORMAT MotionSrvFormat(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default: return f;
+  }
+}
+
+// Depth storage gets the view that reads its depth bits.
+inline DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return f;
+  }
+}
+
+inline void WriteMotionSrv(ID3D12Device* device, uint32_t index, ID3D12Resource* res,
+                           bool is_depth = false) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+  const DXGI_FORMAT f = res->GetDesc().Format;
+  d.Format = is_depth ? DepthSrvFormat(f) : MotionSrvFormat(f);
+  d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  d.Texture2D.MipLevels = 1;
+  device->CreateShaderResourceView(res, &d, SlotAt(index).cpu);
+}
+
 inline void WriteUav(ID3D12Device* device, uint32_t index, ID3D12Resource* res) {
   D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
   d.Format = res->GetDesc().Format;
@@ -357,13 +394,27 @@ inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                        ID3D12Resource* color_copy, ID3D12Resource* proxy,
                        ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t frame,
                        float transfer, float max_ratio, float colour, const Bridge& bridge,
-                       uint32_t debug) {
+                       uint32_t debug, ID3D12Resource* motion = nullptr, float mv_scale_x = 1.0f,
+                       float mv_scale_y = 1.0f, ID3D12Resource* depth = nullptr) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
 
   const uint32_t base = (frame % kRingSize) * kSlotsPerFrame;
-  WriteSrv(device, base + 4, color_copy);
-  WriteSrv(device, base + 5, model_out);
+  // Debug view 4 puts depth in the original's slot (t0): it reads nothing else.
+  if (debug == 4 && depth != nullptr)
+    WriteMotionSrv(device, base + 4, depth, true);
+  else
+    WriteSrv(device, base + 4, color_copy);
+  // Debug view 4 shows the motion vectors as the model gets them: they take the model's slot,
+  // and the guard and colour constants carry the MV scale.
+  const bool show_motion = debug == 4 && motion != nullptr;
+  if (show_motion) {
+    WriteMotionSrv(device, base + 5, motion);
+    max_ratio = mv_scale_x;
+    colour = mv_scale_y;
+  } else {
+    WriteSrv(device, base + 5, model_out);
+  }
   WriteUav(device, base + 6, game_out);
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
