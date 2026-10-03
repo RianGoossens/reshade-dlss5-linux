@@ -49,6 +49,8 @@ inline State d;
 
 inline bool Fail(const char* why, HRESULT hr = S_OK) {
   ngx_probe::Logf("nr-d3d11: %s (0x%08x) -- D3D11 standalone disabled", why, (unsigned)hr);
+  std::snprintf(nr_runner::s.sa_status, sizeof(nr_runner::s.sa_status),
+                "D3D11 transport failed: %s (see ReShade.log)", why);
   d.failed = true;
   return false;
 }
@@ -68,8 +70,16 @@ constexpr char kDepthCs[] =
     "  dst[id.xy] = src.Load(int3(id.xy, 0));\n"
     "}\n";
 
+// Called by the runner's watchdog when the D3D12 side stopped: the D3D11 context waits on this
+// fence for the result, so signalling it from the CPU releases the game.
+inline void Rescue() {
+  if (d.fence12 != nullptr) d.fence12->Signal(d.value);
+  d.failed = true;
+}
+
 inline bool EnsureDevice(ID3D11Device* dev11, ID3D11DeviceContext* ctx) {
   if (d.dev12 != nullptr) return true;
+  nr_runner::rescue_hook = Rescue;
   d.dev11 = dev11;
   HRESULT hr = ctx->QueryInterface(IID_PPV_ARGS(&d.ctx4));
   if (FAILED(hr)) return Fail("ID3D11DeviceContext4 unavailable", hr);
@@ -139,8 +149,34 @@ inline void Release(Shared& t) {
   t = {};
 }
 
-// A texture both APIs see: created shared on D3D12 with simultaneous access (D3D11 cannot do
-// D3D12 state transitions), opened on D3D11.
+// The other direction: created shared on D3D11, opened on D3D12. Drivers differ in which of the
+// two they accept.
+inline HRESULT SharedFromD3D11(Shared& t, UINT w, UINT h, DXGI_FORMAT format, bool uav) {
+  D3D11_TEXTURE2D_DESC td = {};
+  td.Width = w;
+  td.Height = h;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = format;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+  td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+  HRESULT hr = d.dev11->CreateTexture2D(&td, nullptr, &t.tex11);
+  IDXGIResource1* dxgi = nullptr;
+  HANDLE handle = nullptr;
+  if (SUCCEEDED(hr)) hr = t.tex11->QueryInterface(IID_PPV_ARGS(&dxgi));
+  if (SUCCEEDED(hr))
+    hr = dxgi->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                  nullptr, &handle);
+  if (dxgi != nullptr) dxgi->Release();
+  if (SUCCEEDED(hr)) hr = d.dev12->OpenSharedHandle(handle, IID_PPV_ARGS(&t.tex12));
+  if (handle != nullptr) CloseHandle(handle);
+  return t.tex12 != nullptr ? hr : (FAILED(hr) ? hr : E_FAIL);
+}
+
+// A texture both APIs see: first tried as created shared on D3D12 with simultaneous access
+// (D3D11 cannot do D3D12 state transitions) and opened on D3D11, then the other way round.
 inline bool EnsureShared(Shared& t, UINT w, UINT h, DXGI_FORMAT format, bool uav, const char* name) {
   if (t.tex12 != nullptr && t.w == w && t.h == h && t.format == format) return true;
   if (&t == &d.depth && d.depth_uav != nullptr) {
@@ -170,7 +206,15 @@ inline bool EnsureShared(Shared& t, UINT w, UINT h, DXGI_FORMAT format, bool uav
   if (SUCCEEDED(hr)) hr = dev1->OpenSharedResource1(handle, IID_PPV_ARGS(&t.tex11));
   if (dev1 != nullptr) dev1->Release();
   if (handle != nullptr) CloseHandle(handle);
+  const char* via = "D3D12->D3D11";
   if (FAILED(hr) || t.tex11 == nullptr) {
+    ngx_probe::Logf("nr-d3d11: shared %s via D3D12->D3D11 failed (0x%08x), trying D3D11->D3D12",
+                    name, (unsigned)hr);
+    Release(t);
+    hr = SharedFromD3D11(t, w, h, format, uav);
+    via = "D3D11->D3D12";
+  }
+  if (FAILED(hr) || t.tex11 == nullptr || t.tex12 == nullptr) {
     Release(t);
     char why[96];
     std::snprintf(why, sizeof(why), "shared %s texture (%ux%u format %u) failed", name, w, h,
@@ -180,7 +224,7 @@ inline bool EnsureShared(Shared& t, UINT w, UINT h, DXGI_FORMAT format, bool uav
   t.w = w;
   t.h = h;
   t.format = format;
-  ngx_probe::Logf("nr-d3d11: shared %s %ux%u format=%u", name, w, h, (unsigned)format);
+  ngx_probe::Logf("nr-d3d11: shared %s %ux%u format=%u via %s", name, w, h, (unsigned)format, via);
   return true;
 }
 

@@ -366,14 +366,35 @@ inline void TickGraveyard() {
   }
 }
 
+// Standalone owns its queue, so it can wait for the GPU to be done with a retired feature and
+// release it at once. The graveyard's grace period exists for the game's own command lists; at
+// Pass Count 4 it otherwise holds several sets of four model instances in VRAM at a time.
+inline bool StandaloneIdle(DWORD timeout_ms) {
+  if (s.source != kSrcStandalone || s.sa_fence_out == nullptr || s.sa_event == nullptr)
+    return false;
+  if (s.sa_fence_out->GetCompletedValue() >= s.sa_value) return true;
+  s.sa_fence_out->SetEventOnCompletion(s.sa_value, s.sa_event);
+  return WaitForSingleObject(s.sa_event, timeout_ms) == WAIT_OBJECT_0;
+}
+
+inline void Drop(ID3D12Resource* resource, void* feature, bool now) {
+  if (!now) {
+    Bury(resource, feature);
+    return;
+  }
+  if (resource != nullptr) resource->Release();
+  if (feature != nullptr && s.release != nullptr) s.release(feature);
+}
+
 inline void RetireFeature(const char* why) {
   if (s.feature == nullptr && s.output == nullptr) return;
   ngx_probe::Logf("nr-fwd: retiring NR feature (%s)", why);
-  Bury(s.output, s.feature);
-  Bury(s.color_copy, nullptr);
-  Bury(s.proxy, nullptr);
+  const bool now = StandaloneIdle(2000);
+  Drop(s.output, s.feature, now);
+  Drop(s.color_copy, nullptr, now);
+  Drop(s.proxy, nullptr, now);
   for (int k = 0; k < kMaxPasses - 1; ++k) {
-    Bury(s.inter[k], s.extra[k]);
+    Drop(s.inter[k], s.extra[k], now);
     s.inter[k] = nullptr;
     s.extra[k] = nullptr;
   }
@@ -383,9 +404,6 @@ inline void RetireFeature(const char* why) {
   s.proxy = nullptr;
   s.output_format = DXGI_FORMAT_UNKNOWN;
   s.feature_w = s.feature_h = 0;
-  Bury(s.sa_frame, nullptr);
-  s.sa_frame = nullptr;
-  s.sa_format = DXGI_FORMAT_UNKNOWN;
 }
 
 // Remember the game's DLSS-SR geometry; the NR feature is built against the display resolution and
@@ -991,6 +1009,10 @@ inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource
       s.out_h == bb.Height)
     return true;
   if (s.feature != nullptr) RetireFeature("standalone frame changed size or format");
+  if (s.sa_frame != nullptr) {
+    Drop(s.sa_frame, nullptr, StandaloneIdle(2000));
+    s.sa_frame = nullptr;
+  }
   s.out_w = s.render_w = (unsigned)bb.Width;
   s.out_h = s.render_h = bb.Height;
   s.create_flags = 0;
@@ -1058,6 +1080,41 @@ inline bool StandaloneAllowed() {
   return true;
 }
 
+// The game's queue (or, for D3D11, its context) waits on the GPU for each standalone frame. If
+// the D3D12 side stops finishing frames, the game would wait forever -- with its CPU stuck in
+// Present, where no frame callback can notice. A watchdog thread notices instead: after 3 s
+// without progress it signals the fences from the CPU, which releases every wait, and switches
+// standalone off.
+inline void (*rescue_hook)() = nullptr;  // the D3D11 transport releases its own fence here
+inline std::atomic<UINT64> sa_submitted{0};
+
+inline DWORD WINAPI StandaloneWatchdog(LPVOID) {
+  ULONGLONG stalled_since = 0;
+  for (;;) {
+    Sleep(250);
+    if (s.sa_fence_out == nullptr) continue;
+    const UINT64 expected = sa_submitted.load(std::memory_order_relaxed);
+    if (s.sa_fence_out->GetCompletedValue() >= expected) {
+      stalled_since = 0;
+      continue;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (stalled_since == 0) {
+      stalled_since = now;
+      continue;
+    }
+    if (now - stalled_since < 3000) continue;
+    ngx_probe::Logf("nr-fwd: standalone frame %llu has not finished in 3 s -- releasing the "
+                    "game's waits and switching standalone off", (unsigned long long)expected);
+    s.gave_up = true;
+    std::snprintf(s.sa_status, sizeof(s.sa_status),
+                  "stopped: the GPU stopped finishing frames (see ReShade.log)");
+    s.sa_fence_out->Signal(expected);
+    if (rescue_hook != nullptr) rescue_hook();
+    return 0;
+  }
+}
+
 inline bool EnsureStandaloneQueue(ID3D12Resource* back_buffer) {
   if (s.sa_list != nullptr) return true;
   ID3D12Device* device = nullptr;  // the proxy: ReShade's hooked GetDevice returns it
@@ -1078,6 +1135,7 @@ inline bool EnsureStandaloneQueue(ID3D12Resource* back_buffer) {
   s.sa_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   if (!ok || s.sa_event == nullptr) return GiveUp("standalone: queue/list/fence creation failed");
   ngx_probe::Log("nr-fwd: standalone queue ready (proxy device)");
+  if (HANDLE t = CreateThread(nullptr, 0, StandaloneWatchdog, nullptr, 0, nullptr)) CloseHandle(t);
   return true;
 }
 
@@ -1129,7 +1187,9 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   const int slot = (int)(s.sa_value % 3);
   if (s.sa_fence_out->GetCompletedValue() < s.sa_alloc_value[slot]) {
     s.sa_fence_out->SetEventOnCompletion(s.sa_alloc_value[slot], s.sa_event);
-    WaitForSingleObject(s.sa_event, 1000);
+    // Still in flight: skip this frame rather than reset an allocator the GPU is using. A stall
+    // that lasts is the watchdog's to handle.
+    if (WaitForSingleObject(s.sa_event, 1000) != WAIT_OBJECT_0) return false;
   }
   s.sa_alloc[slot]->Reset();
   ID3D12GraphicsCommandList* cmd = s.sa_list;
@@ -1188,6 +1248,7 @@ inline void SubmitStandalone(ID3D12CommandQueue* game_queue) {
   ID3D12CommandList* lists[] = {s.sa_list};
   s.sa_queue->ExecuteCommandLists(1, lists);
   s.sa_queue->Signal(s.sa_fence_out, v);
+  sa_submitted.store(v, std::memory_order_relaxed);
   game_queue->Wait(s.sa_fence_out, v);
 }
 
@@ -1208,6 +1269,7 @@ inline bool SubmitStandaloneShared(ID3D12Fence* shared, UINT64 wait_value, UINT6
   s.sa_queue->ExecuteCommandLists(1, lists);
   s.sa_queue->Signal(s.sa_fence_out, v);
   s.sa_queue->Signal(shared, signal_value);
+  sa_submitted.store(v, std::memory_order_relaxed);
   return true;
 }
 
