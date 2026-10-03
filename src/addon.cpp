@@ -369,14 +369,6 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
                     "Auto runs it only when the game has no DLSS of its own.");
     if (s.sa_status[0] != 0 && s.source != nr_runner::kSrcDlss)
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
-    if (s.source == nr_runner::kSrcStandalone) {
-      ImGui::Checkbox("Flip motion X", &s.sa_flip_x);
-      Tip("Reverses the motion vectors' horizontal direction. Try it if moving things drag or "
-          "double up sideways.");
-      ImGui::SameLine();
-      ImGui::Checkbox("Flip motion Y", &s.sa_flip_y);
-      Tip("Reverses the motion vectors' vertical direction.");
-    }
   }
 
   if (ImGui::CollapsingHeader("Neural Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -462,12 +454,23 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     bridge |= Slider("Colour strength", &s.colour_strength, 0.0f, 1.0f, "%.2f", 0.0f,
                      "0 keeps the game's own hue exactly; only brightness carries the model's "
                      "verdict. 1 takes the model's colour too.");
+  }
+
+  if (ImGui::CollapsingHeader("Debug")) {
+    ImGui::Combo("Debug view", &s.debug_view,
+                 "Off\0What the model sees\0Model answer\0Difference x20\0Motion vectors\0");
     ImGui::Checkbox("Temporal history", &s.temporal);
     Tip("Off resets the model's history every frame: no ghosting or drag from motion vectors, "
         "but less stable detail. A diagnostic: if drag disappears with this off, the motion "
         "vectors are the cause.");
-    ImGui::Combo("Debug view", &s.debug_view,
-                 "Off\0What the model sees\0Model answer\0Difference x20\0Motion vectors\0");
+    ImGui::BeginDisabled(s.source != nr_runner::kSrcStandalone);
+    ImGui::Checkbox("Flip motion X", &s.sa_flip_x);
+    Tip("Standalone only. Reverses the motion vectors' horizontal direction; the right setting is "
+        "the one where moving things drag least.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Flip motion Y", &s.sa_flip_y);
+    Tip("Standalone only. Reverses the motion vectors' vertical direction.");
+    ImGui::EndDisabled();
   }
 
   if (model.committed) nr_runner::ApplyModelSettings();
