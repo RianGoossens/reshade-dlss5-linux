@@ -1089,12 +1089,17 @@ inline void (*rescue_hook)() = nullptr;  // the D3D11 transport releases its own
 inline std::atomic<UINT64> sa_submitted{0};
 
 inline DWORD WINAPI StandaloneWatchdog(LPVOID) {
+  // A stall is no progress at all, not merely being behind: while frames flow the GPU is always
+  // a frame or two behind the newest submission.
   ULONGLONG stalled_since = 0;
+  UINT64 last_completed = 0;
   for (;;) {
     Sleep(250);
     if (s.sa_fence_out == nullptr) continue;
     const UINT64 expected = sa_submitted.load(std::memory_order_relaxed);
-    if (s.sa_fence_out->GetCompletedValue() >= expected) {
+    const UINT64 completed = s.sa_fence_out->GetCompletedValue();
+    if (completed >= expected || completed != last_completed) {
+      last_completed = completed;
       stalled_since = 0;
       continue;
     }
