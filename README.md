@@ -20,19 +20,24 @@ Highlights:
 - **RenoDX-style controls**: Style, the model intensities, Auto Mask, Skin Structure Strength and
   UI Correction, applied as soon as a slider is released.
 - **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
-- **Works in games without DLSS 5 support**, through
-  [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
+- **Works in games without DLSS at all.** D3D12 games run in **standalone mode** off ReShade's
+  depth and iMMERSE Launchpad's motion vectors, with nothing else to install; D3D11 games go
+  through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
 
 Built on Linux with clang targeting the MSVC ABI (`-target x86_64-pc-windows-msvc`) so the
 vtables and by-value aggregate returns match MSVC-built ReShade.
 
 ## What it does
 
-1. Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft Detours) to learn the
-   live DLSS-SR geometry and formats.
-2. After each DLSS-SR evaluate, runs the DLSSNR model on that frame (once per pass) and composites
-   its answer back over the game's output, so the game's own tone-mapping consumes the enhanced
-   frame.
+1. Finds a frame to work on:
+   - **A DLSS session.** Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft
+     Detours) and, after each DLSS-SR evaluate, takes its output, depth and motion vectors. This
+     is how native DLSS games and games through dlss5-bridge run.
+   - **Standalone.** In a D3D12 game without DLSS, takes the back buffer, ReShade's depth and
+     iMMERSE Launchpad's motion vectors right after Launchpad runs, and starts NGX itself.
+2. Runs the DLSSNR model on that frame (once per pass) and composites its answer back. With DLSS
+   the game's own tone-mapping then consumes the enhanced frame; standalone writes it to the
+   back buffer.
 3. A colour bridge keeps the model, which was trained on display-referred data, from producing a
    veil, noise, or a colour cast. The frame is decoded from its encoding, normalised to diffuse
    white, and shown to the model display-referred. The model's answer is then anchored to the
@@ -42,6 +47,10 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
 
 Open the ReShade overlay → *Add-ons* → **DLSSNR Linux**. **F10** toggles the pass for A/B
 comparison. Settings are saved to `ReShade.ini` under `[ADDON_DLSSNR_LINUX]`.
+
+At the top, **Source** shows where the frame comes from (the game's DLSS session or standalone),
+and **Standalone** picks when standalone mode may run: *Auto* (only in a D3D12 game that never
+starts DLSS of its own), *Always*, or *Off*. Its status line says what it is waiting for.
 
 **Neural Rendering** (the model's own parameters; changing one rebuilds the model on release)
 
@@ -73,7 +82,14 @@ preset resolves to the same model.
 |---|---|
 | Detail strength | How far the frame moves toward the model's answer. 0 = bypass. |
 | Colour strength | 0 keeps the game's own hue; only brightness carries the model's change. 1 takes the model's colour too. |
-| Debug view | What the model sees, the model's answer, or the difference ×20. |
+
+**Debug**
+
+| Setting | Notes |
+|---|---|
+| Debug view | What the model sees, the model's answer, the difference ×20, or the motion vectors it gets (red horizontal, green vertical, depth in blue). |
+| Temporal history | Off resets the model's history every frame. Drag that disappears with it off comes from the motion vectors. |
+| Flip motion X / Y | Standalone only: reverse a motion-vector axis. The right setting is the one where moving things drag least. |
 
 ## Installing the build
 
@@ -90,8 +106,9 @@ one needs.
 - An **RTX 50-series or RTX 40-series** GPU, with a recent NVIDIA driver branch that supports
   DLSS Neural Rendering. The `nvngx_dlssnr.dll` model supports both generations; this add-on has
   only been tested on RTX 50 so far, but is expected to work on RTX 40 — reports welcome.
-- **Proton** with NVAPI/NGX enabled, and **DLSS (Super Resolution) turned on in-game**: this add-on
-  runs off the game's DLSS-SR output, so DLSS must be active.
+- **Proton** with NVAPI/NGX enabled. In a game with DLSS, **turn DLSS (Super Resolution) on
+  in-game**: the add-on runs off its output. Games without DLSS: see
+  [Games without DLSS 5 support](#games-without-dlss-5-support).
 - **ReShade with add-on support** installed for the game's DX12 renderer (the `dxgi` variant).
   D3D11 games work through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which gives them
   a D3D12 DLSS session to hook; keep its `unwrap=0`.
@@ -141,7 +158,7 @@ and setups confirmed working.
    `d3dcompiler_47` override for ReShade effects, how to verify from `ReShade.log`, and the
    logging line to use when reporting a crash.
 
-4. Launch the game, enable **DLSS** in the graphics settings, then open the ReShade overlay
+4. Launch the game, enable **DLSS** in the graphics settings if it has it, then open the ReShade overlay
    (**Home** key) → **Add-ons** tab → **DLSSNR Linux**. Press **F10** any time to A/B toggle the
    pass. `ReShade.log` beside the exe records `nr-fwd:` lines if you need to check it loaded.
 
@@ -150,11 +167,33 @@ and setups confirmed working.
 
 ## Games without DLSS 5 support
 
-The add-on hooks a D3D12 DLSS Super Resolution session, which only native D3D12 games with DLSS
-have. Everything else goes through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), a
-ReShade add-on that gives the game a private D3D12 DLSS session for this add-on to hook. Download
-it only from its GitHub releases, and put `dlss5-bridge.addon64` beside the game executable with
-this add-on's files.
+Native D3D12 games with DLSS need nothing else. For the rest:
+
+| Game | Route |
+|---|---|
+| D3D12, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
+| D3D11 or Vulkan, with DLSS | dlss5-bridge mirrors the game's DLSS. |
+| D3D11, no DLSS | dlss5-bridge builds a substitute DLSS session from Launchpad's motion vectors. |
+
+Both standalone and the bridge's substitute need ReShade's depth and Launchpad's motion vectors
+set up, as described under [Depth and motion vectors](#depth-and-motion-vectors).
+
+### D3D12 games without DLSS: standalone mode
+
+1. Install ReShade as `dxgi.dll` and this add-on's two files, as for any D3D12 game. No
+   `nvngx_dlss.dll` and no bridge are needed; if dlss5-bridge is installed, remove it.
+2. Set up depth and Launchpad as below.
+3. Get into gameplay: after about 10 seconds *Auto* starts standalone, and the panel's Source
+   line reads **standalone**.
+
+The add-on asks Launchpad for its motion vectors itself; Launchpad computes them only when some
+effect requests them.
+
+### D3D11 and Vulkan games: dlss5-bridge
+
+[dlss5-bridge](https://github.com/NIGos/dlss5-bridge) is a ReShade add-on that gives the game a
+private D3D12 DLSS session for this add-on to hook. Download it only from its GitHub releases,
+and put `dlss5-bridge.addon64` beside the game executable with this add-on's files.
 
 In `dlss5-bridge.cfg` (written on first launch) always set:
 
@@ -164,21 +203,19 @@ unwrap=0
 
 With the default `unwrap=1`, the bridge delivers no frames to this add-on under Proton.
 
-### D3D11 or Vulkan games with DLSS
+#### With the game's own DLSS
 
 The bridge mirrors the game's own DLSS onto its D3D12 session automatically. Turn DLSS on in the
 game. *Encoding → Auto* picks the right decode for the bridge's output.
 
-### Games without any DLSS
+#### Without DLSS
 
 The bridge can build a substitute DLAA session from the frame, ReShade's depth, and motion vectors.
 
 1. Copy an **`nvngx_dlss.dll` of version 3.1.13 or newer** from any game that ships DLSS into
    the game folder. The game has none, and the driver doesn't supply one there.
-2. Install [**iMMERSE**](https://github.com/martymcmodding/iMMERSE) from Marty's Mods (the
-   ReShade installer offers it) and enable the **MartysMods_Launchpad** effect. Launchpad
-   computes the motion vectors the bridge feeds to DLSS. NVIDIA's hardware optical flow, the
-   bridge's other motion source, isn't available under Proton.
+2. Set up depth and Launchpad as below. NVIDIA's hardware optical flow, the bridge's other motion
+   source, isn't available under Proton.
 3. In `dlss5-bridge.cfg` set:
 
    ```
@@ -190,20 +227,29 @@ The bridge can build a substitute DLAA session from the frame, ReShade's depth, 
    `synth=1` (*Replace DLSS when the game isn't using its own* in the bridge's panel) enables the
    substitute session, and `ofa_grid=0` takes motion vectors from the ReShade shader instead of
    optical flow.
-4. Make sure ReShade is using the right depth buffer. ReShade's built-in **Generic Depth** add-on
-   (overlay → *Add-ons* tab) lists every depth buffer the game draws to; if it picks the wrong one,
-   tick the correct one there: usually the screen-sized one with the most vertices. Enable the
-   **DisplayDepth** effect to check: adjust ReShade's depth settings (upside down, reversed,
-   logarithmic) until near objects are dark and far ones light, then disable it again. The
-   bridge's panel shows whether depth and motion inputs are bound.
+The bridge's panel shows whether depth and motion inputs are bound. The substitute is a real DLSS
+session fed approximated inputs, so text can soften and dense foliage can smear a little.
 
-   The bridge reads depth through a loaded effect that uses it, not from Generic Depth directly.
-   Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off: with either on,
-   only enabled effects load, and the bridge reports no depth buffer even when Generic Depth has
-   the right one selected.
+### Depth and motion vectors
 
-The substitute is a real DLSS session fed approximated inputs, so text can soften and dense
-foliage can smear a little.
+1. Install [**iMMERSE**](https://github.com/martymcmodding/iMMERSE) from Marty's Mods (the
+   ReShade installer offers it), enable **MartysMods_Launchpad** and move it to the top of the
+   effect list. Launchpad estimates motion vectors from the image.
+2. Make sure ReShade uses the right depth buffer. ReShade's built-in **Generic Depth** add-on
+   (overlay → *Add-ons* tab) lists every depth buffer the game draws to; if it picks the wrong
+   one, tick the screen-sized one with the most vertices. Several can show the same draw calls;
+   the vertex count tells them apart. Never a square shadow map.
+3. Enable the **DisplayDepth** effect to check, and adjust ReShade's global preprocessor
+   definitions until near objects are dark and far ones light, then disable it again:
+   - `RESHADE_DEPTH_INPUT_IS_REVERSED=1` for most modern engines (Unreal included).
+   - `RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN=1` if the image is upside down.
+   - **Upscaler on (FSR, TSR, a resolution scale)?** The game then draws depth into the top-left
+     part of the buffer. Set `RESHADE_DEPTH_INPUT_X_SCALE` and `RESHADE_DEPTH_INPUT_Y_SCALE` to
+     1 / the render scale: 1.5 for Quality, 1.724 for Balanced, 2 for Performance, 3 for Ultra
+     Performance. Turn dynamic resolution off. Launchpad and the add-on both follow these.
+4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
+   depth through a loaded effect that uses it; with either on, only enabled effects load.
+5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.
 
 ## Building
 
