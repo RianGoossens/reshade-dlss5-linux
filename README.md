@@ -20,9 +20,10 @@ Highlights:
 - **RenoDX-style controls**: Style, the model intensities, Auto Mask, Skin Structure Strength and
   UI Correction, applied as soon as a slider is released.
 - **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
-- **Works in games without DLSS at all.** D3D12 games run in **standalone mode** off ReShade's
-  depth and iMMERSE Launchpad's motion vectors, with nothing else to install; D3D11 games go
-  through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
+- **Works in games without DLSS at all.** D3D12 and D3D11 games run in **standalone mode** off
+  ReShade's depth and iMMERSE Launchpad's motion vectors, with nothing else to install. D3D11 and
+  Vulkan games with their own DLSS can go through
+  [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
 
 Built on Linux with clang targeting the MSVC ABI (`-target x86_64-pc-windows-msvc`) so the
 vtables and by-value aggregate returns match MSVC-built ReShade.
@@ -171,25 +172,30 @@ Native D3D12 games with DLSS need nothing else. For the rest:
 
 | Game | Route |
 |---|---|
-| D3D12, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
-| D3D11 or Vulkan, with DLSS | dlss5-bridge mirrors the game's DLSS. |
-| D3D11, no DLSS | dlss5-bridge builds a substitute DLSS session from Launchpad's motion vectors. |
+| D3D12 or D3D11, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
+| D3D11 or Vulkan, with DLSS | dlss5-bridge mirrors the game's DLSS (optional: standalone works too). |
 
-Both standalone and the bridge's substitute need ReShade's depth and Launchpad's motion vectors
-set up, as described under [Depth and motion vectors](#depth-and-motion-vectors).
+Standalone needs ReShade's depth and Launchpad's motion vectors set up, as described under
+[Depth and motion vectors](#depth-and-motion-vectors).
 
-### D3D12 games without DLSS: standalone mode
+### Games without DLSS: standalone mode
 
-1. Install ReShade as `dxgi.dll` and this add-on's two files, as for any D3D12 game. No
-   `nvngx_dlss.dll` and no bridge are needed; if dlss5-bridge is installed, remove it.
+1. Install ReShade for the game's API (`dxgi.dll` for D3D12, `d3d11.dll` for D3D11) and this
+   add-on's two files beside the executable. No `nvngx_dlss.dll` and no bridge are needed; while
+   dlss5-bridge is installed, *Auto* leaves the game to it.
 2. Set up depth and Launchpad as below.
 3. Get into gameplay: after about 10 seconds *Auto* starts standalone, and the panel's Source
    line reads **standalone**.
 
-The add-on asks Launchpad for its motion vectors itself; Launchpad computes them only when some
-effect requests them.
+In a D3D12 game the pass runs on the game's own device. A D3D11 game's frame, depth and motion
+vectors are copied to a private D3D12 device each frame and the result is copied back; ordinary
+D3D11 games need nothing extra for that.
 
-### D3D11 and Vulkan games: dlss5-bridge
+The add-on asks Launchpad for its motion vectors itself; Launchpad computes them only when some
+effect requests them. If the GPU ever stops finishing frames, standalone switches itself off
+after 3 seconds rather than hang the game, and says so in the panel.
+
+### Games with their own DLSS on D3D11 or Vulkan: dlss5-bridge
 
 [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) is a ReShade add-on that gives the game a
 private D3D12 DLSS session for this add-on to hook. Download it only from its GitHub releases,
@@ -208,7 +214,7 @@ With the default `unwrap=1`, the bridge delivers no frames to this add-on under 
 The bridge mirrors the game's own DLSS onto its D3D12 session automatically. Turn DLSS on in the
 game. *Encoding → Auto* picks the right decode for the bridge's output.
 
-#### Without DLSS
+#### Without DLSS (superseded by standalone mode)
 
 The bridge can build a substitute DLAA session from the frame, ReShade's depth, and motion vectors.
 
@@ -320,6 +326,9 @@ This project was studied from, and stands on, the following work. Please support
   add-on approach, the DLSS5 colour-bridge composition concepts (display-referred encode, anchored
   resolve), the Encoding / Diffuse White model and its defaults, and the layout of the Neural
   Rendering controls.
+- **dlss5-bridge** by NIGos (<https://github.com/NIGos/dlss5-bridge>) — MIT. The D3D11 standalone
+  transport follows its recipe for sharing textures and a fence between D3D11 and a private D3D12
+  device under Proton, including the depth conversion and the 12_x feature level.
 - **ReShade** by Patrick Mours (<https://github.com/crosire/reshade>) — the add-on SDK / API this
   loads into.
 - **Microsoft Detours** (<https://github.com/microsoft/Detours>) — MIT. Used to hook NGX.
