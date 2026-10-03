@@ -192,7 +192,7 @@ The bridge can build a substitute DLAA session from the frame, ReShade's depth, 
    optical flow.
 4. Make sure ReShade is using the right depth buffer. ReShade's built-in **Generic Depth** add-on
    (overlay → *Add-ons* tab) lists every depth buffer the game draws to; if it picks the wrong one,
-   tick the correct one there (the one with the most draw calls is usually it). Enable the
+   tick the correct one there: usually the screen-sized one with the most vertices. Enable the
    **DisplayDepth** effect to check: adjust ReShade's depth settings (upside down, reversed,
    logarithmic) until near objects are dark and far ones light, then disable it again. The
    bridge's panel shows whether depth and motion inputs are bound.
