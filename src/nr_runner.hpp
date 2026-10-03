@@ -1037,6 +1037,11 @@ inline bool StandaloneAllowed() {
     return false;
   }
   if (s.standalone_mode == kSaAuto) {
+    if (GetModuleHandleA("dlss5-bridge.addon64") != nullptr) {
+      std::snprintf(s.sa_status, sizeof(s.sa_status),
+                    "standing by: dlss5-bridge is installed and feeds this add-on");
+      return false;
+    }
     // nvngx_dlss.dll resident before standalone started NGX means the game loaded it; after
     // that, standalone's own NGX init may have loaded it, so it says nothing.
     if (s.last_dlss_tick != 0 ||
@@ -1080,9 +1085,12 @@ inline bool EnsureStandaloneQueue(ID3D12Resource* back_buffer) {
 // target, the depth and motion textures are shader resources. Records the pass on the standalone
 // list; the addon then flushes ReShade's own list and calls SubmitStandalone, which orders this
 // list after everything ReShade recorded so far and before anything it records next.
+// bb_state is the state the frame resource is in on entry and is left in: RENDER_TARGET for a
+// D3D12 game's back buffer, COMMON for the D3D11 transport's shared texture.
 inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth,
                               ID3D12Resource* motion, bool depth_inverted, float depth_scale_x,
-                              float depth_scale_y) {
+                              float depth_scale_y,
+                              D3D12_RESOURCE_STATES bb_state = D3D12_RESOURCE_STATE_RENDER_TARGET) {
   if (s.gave_up || back_buffer == nullptr) return false;
   if (!StandaloneAllowed()) return false;
   if (depth == nullptr || motion == nullptr) {
@@ -1135,7 +1143,7 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
 
   using nr_compose::Barrier;
   // Back buffer -> the UAV-capable frame copy the pass works on in place.
-  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  Barrier(cmd, back_buffer, bb_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
   Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
   cmd->CopyResource(s.sa_frame, back_buffer);
   Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1160,7 +1168,7 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   cmd->CopyResource(back_buffer, s.sa_frame);
   Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, bb_state);
   std::snprintf(s.sa_status, sizeof(s.sa_status), "running, %ux%u", s.out_w, s.out_h);
   return true;
 }
@@ -1181,6 +1189,26 @@ inline void SubmitStandalone(ID3D12CommandQueue* game_queue) {
   s.sa_queue->ExecuteCommandLists(1, lists);
   s.sa_queue->Signal(s.sa_fence_out, v);
   game_queue->Wait(s.sa_fence_out, v);
+}
+
+// The D3D11 transport's variant: the list waits on a fence the D3D11 context signals once its
+// copies are in, and signals the same fence when the result is ready for it to copy back.
+// Returns false if nothing was recorded this frame, so the caller must not wait.
+inline bool SubmitStandaloneShared(ID3D12Fence* shared, UINT64 wait_value, UINT64 signal_value) {
+  if (!s.sa_pending) return false;
+  s.sa_pending = false;
+  if (FAILED(s.sa_list->Close())) {
+    GiveUp("standalone: command list failed to close");
+    return false;
+  }
+  const UINT64 v = ++s.sa_value;
+  s.sa_alloc_value[(v - 1) % 3] = v;
+  s.sa_queue->Wait(shared, wait_value);
+  ID3D12CommandList* lists[] = {s.sa_list};
+  s.sa_queue->ExecuteCommandLists(1, lists);
+  s.sa_queue->Signal(s.sa_fence_out, v);
+  s.sa_queue->Signal(shared, signal_value);
+  return true;
 }
 
 }  // namespace nr_runner

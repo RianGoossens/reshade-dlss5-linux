@@ -21,6 +21,7 @@
 #include <reshade.hpp>
 
 #include "ngx_probe.hpp"
+#include "nr_d3d11.hpp"
 
 namespace {
 
@@ -143,6 +144,40 @@ void RequestLaunchpadMotion(reshade::api::effect_runtime* runtime,
   cmd_list->barrier(res, resource_usage::render_target, resource_usage::shader_resource);
 }
 
+// D3D11: the same inputs, carried to the D3D12 pass by the transport. ReShade's D3D11 handles
+// are the native objects themselves.
+void OnRenderTechniqueD3D11(reshade::api::effect_runtime* runtime,
+                            reshade::api::command_list* cmd_list,
+                            reshade::api::resource_view rtv, const char* effect) {
+  auto* dev = runtime->get_device();
+  auto view = [&](const char* name) {
+    reshade::api::resource_view srv = {}, srv_srgb = {};
+    const auto var = runtime->find_texture_variable(effect, name);
+    if (var.handle != 0) runtime->get_texture_binding(var, &srv, &srv_srgb);
+    return srv;
+  };
+  const reshade::api::resource_view motion_srv = view(kMotionName);
+  reshade::api::resource_view depth_srv = {};
+  for (const char* depth_name : kDepthNames) {
+    depth_srv = view(depth_name);
+    if (depth_srv.handle != 0) break;
+  }
+  char reversed[8] = {};
+  const bool depth_inverted =
+      runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) &&
+      reversed[0] == '1';
+  nr_d3d11::OnFrame(
+      reinterpret_cast<ID3D11Device*>(dev->get_native()),
+      reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()),
+      reinterpret_cast<ID3D11Resource*>(dev->get_resource_from_view(rtv).handle),
+      reinterpret_cast<ID3D11ShaderResourceView*>(depth_srv.handle),
+      motion_srv.handle != 0
+          ? reinterpret_cast<ID3D11Resource*>(dev->get_resource_from_view(motion_srv).handle)
+          : nullptr,
+      depth_inverted, PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
+      PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE"));
+}
+
 void OnRenderTechnique(reshade::api::effect_runtime* runtime,
                        reshade::api::effect_technique technique,
                        reshade::api::command_list* cmd_list, reshade::api::resource_view rtv,
@@ -153,7 +188,12 @@ void OnRenderTechnique(reshade::api::effect_runtime* runtime,
   char effect[256] = {};
   runtime->get_technique_effect_name(technique, effect);
   RequestLaunchpadMotion(runtime, cmd_list, effect);  // every API: the bridge reads it too
-  if (runtime->get_device()->get_api() != reshade::api::device_api::d3d12) return;
+  const auto api = runtime->get_device()->get_api();
+  if (api == reshade::api::device_api::d3d11) {
+    OnRenderTechniqueD3D11(runtime, cmd_list, rtv, effect);
+    return;
+  }
+  if (api != reshade::api::device_api::d3d12) return;
 
   ID3D12Resource* motion = TextureResource(runtime, runtime->find_texture_variable(effect, kMotionName));
   ID3D12Resource* depth = nullptr;
@@ -507,6 +547,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       // where the detours must be removed before this image disappears.
       if (lp_reserved != nullptr) break;
       ngx_probe::Uninstall();
+      nr_d3d11::Shutdown();
       nr_runner::Shutdown();
       reshade::unregister_overlay("DLSSNR Linux", OnDrawOverlay);
       reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
