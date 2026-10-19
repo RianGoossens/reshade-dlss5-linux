@@ -109,6 +109,38 @@ struct Grave {
   int frames = 0;
 };
 
+// The three independent axes of the colour bridge. Declared here because State holds one of
+// each; the helpers that turn them into a Bridge live further down with the compose code.
+enum Encoding : int {
+  kEncAuto = 0,
+  kEncLinear = 1,
+  kEncSrgb = 2,
+  kEncPq = 3,
+  kEncScrgb = 4,
+  kEncScrgbNl = 5,
+  // Not an encoding: the value the pre-split "Measured (legacy)" mode was saved under. Load
+  // translates it into encoding + wp_source + curve; nothing else may compare against it.
+  kEncLegacyMeasured = 6,
+};
+
+// Measured exposes like classic auto-exposure (Reinhard et al. 2002): the frame's log-average
+// lands at this fraction of white, i.e. white = average / key, so the average reads as mid-grey
+// under either curve. Without it the average itself would be white, and Knee, which caps near 2x
+// white, would clip much of an ordinary frame.
+constexpr float kMeasuredKey = 0.18f;
+
+// What the encode divides by.
+enum WhitePointSource : int {
+  kWpFixed = 0,     // DiffuseWhiteToSource(encoding, nits): a constant
+  kWpMeasured = 1,  // the frame's own EMA-smoothed log-average: tracks the scene
+};
+
+// The curve the model is shown through.
+enum CurveKind : int {
+  kCurveKnee = 0,     // exact below 0.8x white, rolls off above; caps near 2x white
+  kCurveReinhard = 1,  // smooth everywhere, caps near 450x white
+};
+
 struct State {
   bool gave_up = false;
   bool enabled = true;
@@ -139,17 +171,32 @@ struct State {
   float max_ratio = 4.0f;  // a safety net only; not exposed
   float colour_strength = 0.0f;
 
-  // Colour bridge, mirroring the RenoDX DLSS5 addon's Encoding and Diffuse White (nits).
-  // encoding: 0 Auto, 1 Linear BT.709, 2 sRGB, 3 BT.2100 PQ, 4 scRGB, 5 scRGB-nl,
-  // 6 Measured (the original fork's auto-exposure white point + Reinhard).
+  // The colour bridge is three independent choices, not one bundled mode:
+  //   encoding  -- how to decode the buffer to linear (what its numbers mean);
+  //   wp_source -- what to divide by (a constant, or the frame's own measured average);
+  //   curve     -- how to compress the result for the model.
+  // They used to be one enum, which is why a scene-referred buffer could only ever be right
+  // in one of them. encoding: 0 Auto, 1 Linear BT.709, 2 sRGB, 3 BT.2100 PQ, 4 scRGB,
+  // 5 scRGB-nl. 6 is not an encoding: it is the pre-split "Measured (legacy)" value, read
+  // once at load and translated into the three fields.
   int encoding = 0;
+  int wp_source = kWpFixed;
+  int curve = kCurveKnee;
   bool diffuse_white_override = false;
   float diffuse_white_nits = 100.0f;
 
-  // Measured mode only: the log-average luminance, EMA-smoothed; -1 until the first reading
-  // lands. wp_scale is the user's multiplier on top.
+  // The frame's log-average luminance, EMA-smoothed; -1 until the first reading lands.
+  // wp_scale is the user's multiplier on top. Measured only reads it, but it is fed every
+  // frame whatever the source, so switching to Measured is instant.
   float wp_ema = -1.0f;
   float wp_scale = 1.0f;
+  // Readings to drop before the EMA is trusted again. The readback ring holds kReadbackRing
+  // frames of the *old* decode's units after an encoding change, and seeding from those would
+  // put a value in the wrong units into the EMA for a second.
+  int wp_discard = 0;
+  // The resolved decode the EMA was measured under, or -1 before the first pass. A change
+  // means every reading in the EMA and the readback ring is in the old decode's units.
+  int wp_encoding = -1;
 
   // What the last frame actually used, for the overlay.
   int active_encoding = 0;
@@ -672,16 +719,8 @@ inline void WriteTuning(void* p) {
 }
 
 // --- colour bridge ----------------------------------------------------------
-
-enum Encoding : int {
-  kEncAuto = 0,
-  kEncLinear = 1,
-  kEncSrgb = 2,
-  kEncPq = 3,
-  kEncScrgb = 4,
-  kEncScrgbNl = 5,
-  kEncMeasured = 6,
-};
+// Encoding, WhitePointSource and CurveKind are declared with the state above; this is where
+// they turn into a Bridge.
 
 inline bool IsUnormColorFormat(DXGI_FORMAT f) {
   switch (f) {
@@ -879,26 +918,50 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
     nr_compose::Barrier(cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-  // The colour bridge for this frame. Measured mode folds the latest luminance reading (a few
-  // frames old, absorbed by the EMA) into the smoothed white point; every other encoding uses a
-  // fixed diffuse white, so nothing about the picture the model sees moves with the scene.
+  // The colour bridge, as three independent choices rather than one bundled mode.
+  //
+  // The measurement is fed every frame whatever the source: the lum shaders decode with the
+  // bridge's own encoding, so a reading lands in that encoding's units (nits for PQ, buffer
+  // units for linear) and the EMA is only meaningful for the encoding that produced it.
   const int encoding = ResolveEncoding(s.encoding, s.output_format);
-  nr_compose::Bridge bridge = {};
-  if (encoding == kEncMeasured) {
+  {
+    // A decode change invalidates both the EMA and the readback ring, which still holds the
+    // old decode's units for kReadbackRing frames. Detected here rather than flagged by the
+    // overlay: the evaluate thread writes wp_ema/wp_discard (the overlay only reads wp_ema
+    // for display), and it sees the new encoding in the same pass it would have used the
+    // stale one.
+    if (s.wp_encoding != encoding) {
+      s.wp_encoding = encoding;
+      s.wp_ema = -1.0f;
+      s.wp_discard = static_cast<int>(nr_compose::kReadbackRing) - 1;
+    }
     const float raw_wp = nr_compose::ReadWhitePoint(s.eval_count);
-    if (raw_wp > 0.0f && raw_wp == raw_wp) {
+    if (s.wp_discard > 0) {
+      --s.wp_discard;
+    } else if (raw_wp > 0.0f && raw_wp == raw_wp) {
       s.wp_ema = (s.wp_ema <= 0.0f) ? raw_wp : s.wp_ema + 0.05f * (raw_wp - s.wp_ema);
     }
-    float wp = (s.wp_ema > 0.0f) ? s.wp_ema : 1.0f;
-    bridge.white_point = (wp < 0.01f ? 0.01f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
-    bridge.encoding = kEncLinear;
-    bridge.curve = 1;  // CURVE_REINHARD
+  }
+
+  // The constant this encoding would use, also the fallback before the first reading lands.
+  const float nits =
+      s.diffuse_white_override ? s.diffuse_white_nits : AutoDiffuseWhiteNits(encoding);
+  const float fixed_wp = DiffuseWhiteToSource(encoding, nits < 1.0f ? 1.0f : nits);
+
+  nr_compose::Bridge bridge = {};
+  bridge.encoding = (uint32_t)encoding;
+  bridge.curve = (uint32_t)s.curve;
+  if (s.wp_source == kWpMeasured) {
+    // Auto-exposure. A scene-referred buffer's scale moves with the scene -- Control's swings
+    // 6x within one session -- so no constant can track it; the frame's own average can.
+    // The floor matches SourceToRel's own 1e-4 guard: an older 0.01 floor silently doubled
+    // the white point in dark scenes, where this buffer's average sits near 0.005.
+    float wp = (s.wp_ema > 0.0f) ? s.wp_ema / kMeasuredKey : fixed_wp;
+    bridge.white_point = (wp < 1e-4f ? 1e-4f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
   } else {
-    const float nits =
-        s.diffuse_white_override ? s.diffuse_white_nits : AutoDiffuseWhiteNits(encoding);
-    bridge.white_point = DiffuseWhiteToSource(encoding, nits < 1.0f ? 1.0f : nits);
-    bridge.encoding = (uint32_t)encoding;
-    bridge.curve = 0;  // CURVE_KNEE
+    // White point scale is Measured's own: a fixed white point already has Diffuse White (nits),
+    // and a scale left over from a Measured session must not move the fixed picture unseen.
+    bridge.white_point = fixed_wp;
   }
   s.active_encoding = encoding;
   s.active_white_point = bridge.white_point;

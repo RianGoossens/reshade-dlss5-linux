@@ -316,6 +316,9 @@ void LoadSettings() {
   reshade::get_config_value(nullptr, kConfigSection, "DetailStrength", s.transfer);
   reshade::get_config_value(nullptr, kConfigSection, "ColourStrength", s.colour_strength);
   reshade::get_config_value(nullptr, kConfigSection, "WhitePointScale", s.wp_scale);
+  reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingWhitePointSource",
+                            s.wp_source);
+  reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingCurve", s.curve);
 
   // A hand-edited ini must not push values past what the model or the compose pass tolerate.
   // Intensities are forwarded unvalidated beyond the slider range, as in RenoDX, but not negative.
@@ -329,7 +332,26 @@ void LoadSettings() {
   s.global_tone = Clamp(s.global_tone, 0.0f, 4.0f);
   s.local_tone = Clamp(s.local_tone, 0.0f, 4.0f);
   s.skin_structure = Clamp(s.skin_structure, 0.0f, 4.0f);
-  if (s.encoding < 0 || s.encoding > nr_runner::kEncMeasured) s.encoding = 0;
+  // Pre-split value: Encoding 6 was "Measured (legacy)", which bundled a measured white point
+  // and the Reinhard curve with a forced linear decode. Translate it into the three fields.
+  // Auto resolves to linear for the float formats that mode ran on; a UNORM game gains the sRGB
+  // decode it should have had all along.
+  if (s.encoding == nr_runner::kEncLegacyMeasured) {
+    s.encoding = nr_runner::kEncAuto;
+    s.wp_source = nr_runner::kWpMeasured;
+    s.curve = nr_runner::kCurveReinhard;
+    // Persist the translation once, so it does not re-run on every load. Only fires for the
+    // legacy value itself, so a later explicit user choice of wp_source/curve is never touched.
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding",
+                              s.encoding);
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingWhitePointSource",
+                              s.wp_source);
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingCurve", s.curve);
+  }
+  if (s.encoding < 0 || s.encoding > nr_runner::kEncScrgbNl) s.encoding = 0;
+  if (s.wp_source < 0 || s.wp_source > nr_runner::kWpMeasured)
+    s.wp_source = nr_runner::kWpFixed;
+  if (s.curve < 0 || s.curve > nr_runner::kCurveReinhard) s.curve = nr_runner::kCurveKnee;
   if (s.preset < 0 || s.preset > 7) s.preset = 0;
   if (s.pass_count < 1 || s.pass_count > nr_runner::kMaxPasses) s.pass_count = 1;
   if (s.standalone_mode < 0 || s.standalone_mode > nr_runner::kSaOff) s.standalone_mode = 0;
@@ -366,6 +388,9 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "ColourStrength", s.colour_strength);
   reshade::set_config_value(nullptr, kConfigSection, "HighlightGuard", static_cast<const char*>(nullptr));
   reshade::set_config_value(nullptr, kConfigSection, "WhitePointScale", s.wp_scale);
+  reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingWhitePointSource",
+                            s.wp_source);
+  reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingCurve", s.curve);
 
   // Retired pre-mirror keys, so they cannot override the new ones on the next load.
   reshade::set_config_value(nullptr, kConfigSection, "Intensity",
@@ -435,8 +460,8 @@ Edit Checkbox(const char* label, bool* value, const char* tip) {
   return e;
 }
 
-constexpr const char* kEncodingNames[] = {"Auto",  "Linear BT.709", "sRGB", "BT.2100 PQ",
-                                          "scRGB", "scRGB-nl",      "Measured (legacy)"};
+constexpr const char* kEncodingNames[] = {"Auto", "Linear BT.709", "sRGB", "BT.2100 PQ",
+                                          "scRGB", "scRGB-nl"};
 
 // The settings panel, under ReShade's Add-ons tab. Laid out like the RenoDX DLSS5 addon's Neural
 // Rendering section; the fork's own compose controls follow under their own header.
@@ -509,47 +534,87 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     model |= passes;
   }
 
-  if (ImGui::CollapsingHeader("Encoding", ImGuiTreeNodeFlags_DefaultOpen)) {
-    bridge |= Combo("Encoding##source", &s.encoding,
-                    "Auto\0Linear BT.709\0sRGB\0BT.2100 PQ\0scRGB\0scRGB-nl\0Measured (legacy)\0", 0,
-                    "How the game's DLSS output is encoded. Auto treats native DLSS output as linear "
-                    "BT.709, and a UNORM output (the dlss5-bridge on a D3D11 game) as sRGB.\n"
-                    "Measured is the original fork's behaviour: an auto-exposure white point "
-                    "measured every frame.");
+  if (ImGui::CollapsingHeader("Colour bridge", ImGuiTreeNodeFlags_DefaultOpen)) {
+    // Axis 1: the decode -- what the buffer's numbers mean.
+    Edit enc = Combo("Encoding##source", &s.encoding,
+                     "Auto\0Linear BT.709\0sRGB\0BT.2100 PQ\0scRGB\0scRGB-nl\0", 0,
+                     "How the game's DLSS output is encoded. Auto treats native DLSS output as "
+                     "linear BT.709, and a UNORM output (the dlss5-bridge on a D3D11 game) as "
+                     "sRGB.\nThis only decides how to reach linear. The white point and the "
+                     "curve below are separate choices.");
+    // Changing the decode deliberately does NOT reset the white point or the curve: they are
+    // independent axes, and clobbering them would make an A/B across encodings impossible.
+    // The EMA reset a decode change does require is handled by the evaluate thread, which
+    // detects it from the resolved encoding itself.
+    bridge |= enc;
     const int active = s.active_encoding;
-    if (s.encoding == nr_runner::kEncAuto && active != nr_runner::kEncAuto) {
+    const int n_enc = (int)(sizeof(kEncodingNames) / sizeof(kEncodingNames[0]));
+    if (s.encoding == nr_runner::kEncAuto && active > 0 && active < n_enc) {
       ImGui::TextDisabled("Auto resolved to: %s", kEncodingNames[active]);
     }
 
-    if (s.encoding == nr_runner::kEncMeasured) {
+    // Axis 2: the white point -- what the encode divides by. Measured is a checkbox on the
+    // nits row rather than a mode of its own: both sources are the same quantity, so the
+    // slider that sets one is the slider the other temporarily covers, and the multiplier
+    // below applies to either. Keeping all of it on screen at once is what makes an A/B
+    // across sources a comparison of the source alone.
+    bool measured = s.wp_source == nr_runner::kWpMeasured;
+    const int effective = (s.encoding == nr_runner::kEncAuto && active != nr_runner::kEncAuto)
+                              ? active
+                              : s.encoding;
+    const float auto_nits = nr_runner::AutoDiffuseWhiteNits(effective);
+    if (!s.diffuse_white_override) s.diffuse_white_nits = auto_nits;
+
+    Edit dw;
+    ImGui::BeginDisabled(measured);
+    dw.changed = ImGui::SliderFloat("Diffuse White (nits)", &s.diffuse_white_nits, 40.0f, 500.0f,
+                                    "%.0f");
+    if (dw.changed) s.diffuse_white_override = true;
+    Tip("Diffuse-white balance: the brightness the model is shown as paper white. Automatic "
+        "values are 100 nits for linear BT.709 and sRGB, 250 nits for BT.2100 PQ and linear "
+        "scRGB, and 203 nits for scRGB-nl.\nEnter a custom value directly, or reset to restore "
+        "the current encoding's automatic value.");
+    if (ResetButton("Diffuse White")) {
+      s.diffuse_white_override = false;
+      s.diffuse_white_nits = auto_nits;
+      dw.changed = true;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Measured##wp", &measured)) {
+      s.wp_source = measured ? nr_runner::kWpMeasured : nr_runner::kWpFixed;
+      dw.changed = true;
+    }
+    Tip("Measured sets white from the frame's own average brightness, re-anchored every frame "
+        "(white = average / 0.18, the standard auto-exposure key, so the average reads as "
+        "mid-grey), and disables Diffuse White above. It is the only source that survives a buffer whose scale "
+        "moves with the scene: a scene-referred game can swing several times within one session, "
+        "and no constant tracks that, so the model is shown a near-black frame in dark areas and "
+        "answers with noise.\nThe measurement runs either way, so switching it on is instant.");
+    bridge |= dw;
+
+    if (measured) {
       bridge |= Slider("White point scale", &s.wp_scale, 0.1f, 4.0f, "%.2f", 1.0f,
-                       "Multiplier on the measured white point.");
+                       "Multiplier on the measured white point: above 1 shows the model a darker "
+                       "frame, below 1 a brighter one. For scenes that auto-exposure gets wrong, "
+                       "such as mostly dark or mostly bright ones.");
       if (s.wp_ema > 0.0f) {
-        ImGui::Text("Measured white point: %.4f", s.wp_ema);
+        ImGui::Text("Measured white point: %.4f (frame average %.4f)",
+                    s.wp_ema / nr_runner::kMeasuredKey * s.wp_scale, s.wp_ema);
       } else {
         ImGui::TextUnformatted("Measured white point: (measuring...)");
       }
-    } else {
-      const int effective = (s.encoding == nr_runner::kEncAuto && active != nr_runner::kEncAuto)
-                                ? active
-                                : s.encoding;
-      const float auto_nits = nr_runner::AutoDiffuseWhiteNits(effective);
-      if (!s.diffuse_white_override) s.diffuse_white_nits = auto_nits;
-      Edit dw;
-      dw.changed = ImGui::SliderFloat("Diffuse White (nits)", &s.diffuse_white_nits, 40.0f, 500.0f,
-                                      "%.0f");
-      if (dw.changed) s.diffuse_white_override = true;
-      Tip("Diffuse-white balance: the brightness the model is shown as paper white. Automatic "
-          "values are 100 nits for linear BT.709 and sRGB, 250 nits for BT.2100 PQ and linear "
-          "scRGB, and 203 nits for scRGB-nl.\nEnter a custom value directly, or reset to restore "
-          "the current encoding's automatic value.");
-      if (ResetButton("Diffuse White")) {
-        s.diffuse_white_override = false;
-        s.diffuse_white_nits = auto_nits;
-        dw.changed = true;
-      }
-      bridge |= dw;
     }
+
+    // Axis 3: the curve -- how the frame is compressed for the model.
+    bridge |= Combo("Curve##curve", &s.curve, "Knee\0Reinhard\0", 0,
+                    "Knee passes everything below 0.8x white through untouched and rolls off "
+                    "above it, but can only represent up to about 2x white: it assumes content "
+                    "already clamped to white, so scene-referred highlights pile up at its cap "
+                    "where the inverse is exponentially sensitive.\n"
+                    "Reinhard compresses smoothly everywhere with no boundary to cross, and "
+                    "reaches about 450x white.");
   }
 
   if (ImGui::CollapsingHeader("Composition")) {

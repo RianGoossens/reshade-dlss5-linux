@@ -6,8 +6,9 @@
 // knee, highlights rolled off smoothly above it, sRGB-encoded. SDR content at its own diffuse white
 // therefore reaches the model almost untouched.
 //
-// The legacy "measured" curve is kept as an option: the white point is then the frame's smoothed
-// log-average luminance and the curve is Reinhard, as in the original fork.
+// The legacy mode split in two: the white point can be the frame's smoothed log-average
+// luminance, and the curve can be Reinhard, as in the original fork -- but each is now chosen
+// on its own rather than arriving bundled as one "Measured (legacy)" mode.
 //
 // Encode and resolve run in the same frame with the same constants, so the round trip is lossless
 // by construction below the curve's cap.

@@ -14,11 +14,14 @@ without the driver's NGX dispatch or its OTA updater.
 
 Highlights:
 
-- **Encoding + Diffuse White.** The game's frame is decoded from its encoding (Auto, Linear
-  BT.709, sRGB, BT.2100 PQ, scRGB, scRGB-nl) and normalised to a fixed diffuse white in nits, so
-  what the model sees doesn't shift with scene brightness.
-- **A gentle curve.** The model is shown the frame exactly up to 0.8x diffuse white; only
+- **Encoding, white point and curve, independently.** The game's frame is decoded from its
+  encoding (Auto, Linear BT.709, sRGB, BT.2100 PQ, scRGB, scRGB-nl), divided by a white point
+  that is either a fixed diffuse white in nits or the frame's own measured average, and shown
+  through a knee or Reinhard curve. Measured is what a scene-referred buffer needs: its scale
+  moves with the scene, so no constant white point tracks it.
+- **A gentle curve.** The knee shows the model the frame exactly up to 0.8x diffuse white; only
   highlights above that are rolled off. SDR content reaches the model almost untouched.
+  Reinhard, the other choice, compresses smoothly everywhere and reaches ~450x white.
 - **RenoDX-style controls**: Style, the model intensities, Auto Mask, Skin Structure Strength and
   UI Correction, applied as soon as a slider is released.
 - **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
@@ -44,8 +47,9 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
    enhanced frame) or after it, so the game's post-processing consumes the enhanced result;
    standalone writes it to the back buffer.
 3. A colour bridge keeps the model, which was trained on display-referred data, from producing a
-   veil, noise, or a colour cast. The frame is decoded from its encoding, normalised to diffuse
-   white, and shown to the model display-referred. The model's answer is then anchored to the
+   veil, noise, or a colour cast. The frame is decoded from its encoding, divided by the chosen
+   white point (a fixed diffuse white, or the frame's own measured average), and shown to the
+   model display-referred through the chosen curve. The model's answer is then anchored to the
    original, keeping the game's own hue by default.
 
 ## Settings
@@ -75,12 +79,19 @@ RenoDX's *Global Tone Intensity* and the render preset hint are not exposed: the
 `nvngx_dlssnr.dll` never reads `GlobalToneStrength`, and it embeds a single weight set, so every
 preset resolves to the same model.
 
-**Encoding**
+**Colour bridge**
+
+Three independent choices. They used to be one bundled mode, which meant a buffer whose scale
+moves with the scene could only ever be right in one of them. Configs saved with that old mode
+(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard*; a UNORM game gains
+the sRGB decode it should have had all along.
 
 | Setting | Notes |
 |---|---|
-| Encoding | How the game's DLSS output is encoded. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). *Measured (legacy)* instead measures the frame's average brightness every frame and uses it as the white point. |
-| Diffuse White (nits) | The brightness shown to the model as paper white. Defaults as in RenoDX: 100 for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
+| Encoding | How to decode the buffer to linear. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). Independent of the two settings below: changing it leaves them alone, so an A/B across encodings compares the encoding. |
+| Diffuse White (nits) + *Measured* | What the encode divides by. The slider sets a constant; the *Measured* checkbox beside it swaps the source for the frame's own average brightness, re-anchored every frame (white = average ÷ 0.18, the standard auto-exposure key, so the average reads as mid-grey under either curve), and disables the slider. Measured is the only source that survives a scene-referred buffer, whose scale can swing several times within one session — a constant on such a buffer leaves the model looking at a near-black frame in dark areas, and its answer there is noise. The measurement runs either way, so the toggle is instant. Defaults as in RenoDX: 100 nits for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
+| White point scale | *Measured* only: a multiplier on the measured white point, for scenes auto-exposure gets wrong (mostly dark or mostly bright). |
+| Curve | How the frame is compressed for the model. *Knee* passes everything below 0.8× white through untouched and rolls off above, but represents only up to about 2× white — it assumes content already clamped to white, so scene-referred highlights pile up at its cap. *Reinhard* compresses smoothly everywhere and reaches about 450× white. |
 
 **Composition**
 
