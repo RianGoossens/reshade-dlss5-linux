@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <map>
+#include <string>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -279,6 +281,16 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
   // none of its semantics. Before the first SR create has been seen (sr_handle null) every
   // evaluate counts, and the pass stays out anyway behind the no-DLSS-session gate.
   const bool sr = sr_handle == nullptr || handle == sr_handle;
+  // Force FSR3: hard gate -- the pass never runs in DLSS evaluates (what old Off meant).
+  // One-time log (spec): the first entry only, never silently.
+  if (nr_runner::s.frame_source == nr_runner::kFsFsr) {
+    static bool forced_logged = false;
+    if (!forced_logged) {
+      forced_logged = true;
+      Log("nr-fwd: FSR3 session forced \u2014 DLSS evaluates ignored");
+    }
+    return real_D3D12_EvaluateFeature(cmd_list, handle, params, callback);
+  }
   // Model resolution Render: enhance the color input before the game's DLSS-SR upscales it, on
   // this same command list, so recording order is the execution order. Upscaled runs the pass
   // after the evaluate instead, on the success path below.
@@ -349,16 +361,23 @@ inline bool blocked = false;  // a state TryInstall must never retry out of
 // detour and a live one from another tool (hook chaining is legal) are byte
 // identical. So the fact lives in a named mapping that is deliberately never
 // closed: it survives our unload, and the next image finds it by name.
-// Nonzero while our detours are attached; zeroed by a clean detach.
-inline LONG* AttachedMarker() {
-  static LONG* marker = [] {
+// Nonzero while our detours are attached; zeroed by a clean detach. The name
+// is keyed by probe: each marker guards *that probe's* detour set, so a stale
+// detour of one probe blocks only that probe's re-attach. Cross-probe blocking
+// has no jmp-cycle basis — different probes patch different function bodies.
+inline LONG* AttachedMarker(const char* tag) {
+  static std::map<std::string, LONG*> markers;
+  const auto it = markers.find(tag);
+  if (it != markers.end()) return it->second;
+  LONG* marker = [tag]() -> LONG* {
     char name[64];
-    std::snprintf(name, sizeof(name), "Local\\dlssnr-ngx-hooks-%lu", GetCurrentProcessId());
+    std::snprintf(name, sizeof(name), "Local\\dlssnr-%s-hooks-%lu", tag, GetCurrentProcessId());
     const HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                               sizeof(LONG), name);  // opens the existing one
     if (mapping == nullptr) return static_cast<LONG*>(nullptr);
     return static_cast<LONG*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG)));
   }();
+  markers.emplace(tag, marker);
   return marker;
 }
 
@@ -386,7 +405,7 @@ inline bool TryInstall() {
   }
   if (module == nullptr) return false;
 
-  LONG* marker = AttachedMarker();
+  LONG* marker = AttachedMarker("ngx");
   if (marker != nullptr && *marker != 0) {
     // A previous image of this DLL was unloaded without detaching. Its detours
     // point into freed memory; patching over them builds a jmp cycle (the GTA V
@@ -479,7 +498,7 @@ inline void Uninstall() {
   }
   installed = false;
   if (all) {
-    if (LONG* marker = AttachedMarker(); marker != nullptr) *marker = 0;
+    if (LONG* marker = AttachedMarker("ngx"); marker != nullptr) *marker = 0;
   }
   Logf("ngx-probe: detached %d NGX hooks", detached);
 }

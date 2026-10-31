@@ -40,6 +40,11 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
      Detours) and, around each DLSS-SR evaluate, takes the frame -- its color input before the
      upscale or its output after it, per *Model resolution* -- plus depth and motion vectors.
      This is how native DLSS games and games through dlss5-bridge run.
+   - **An FSR3 session.** Hooks `ffxDispatch` on the FidelityFX loader / upscaler DLLs the game
+     already ships (`amd_fidelityfx_loader_dx12.dll` / `amd_fidelityfx_upscaler_dx12.dll`,
+     D3D12 only) and takes the frame from the dispatch parameters -- its color input before the
+     FSR upscale or its output after it, per *Model resolution* -- plus depth and motion vectors,
+     with no ReShade depth or Launchpad setup of its own.
    - **Standalone.** In a game without DLSS (D3D12, D3D11 or Vulkan), takes the back buffer, ReShade's depth and
      iMMERSE Launchpad's motion vectors right after Launchpad runs, and starts NGX itself.
 2. Runs the DLSSNR model on that frame (once per pass) and composites its answer back. With DLSS
@@ -57,9 +62,11 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
 Open the ReShade overlay → *Add-ons* → **DLSSNR Linux**. **F10** toggles the pass for A/B
 comparison. Settings are saved to `ReShade.ini` under `[ADDON_DLSSNR_LINUX]`.
 
-At the top, **Source** shows where the frame comes from (the game's DLSS session or standalone),
-and **Standalone** picks when standalone mode may run: *Auto* (only in a game that never
-starts DLSS of its own), *Always*, or *Off*. Its status line says what it is waiting for.
+At the top, **Source** shows where the frame comes from (the game's DLSS session, its FSR3
+session, or standalone) and picks it: *Auto* walks the priority DLSS → FSR3 → standalone — a DLSS
+evaluate or FSR3 dispatch within the last 3 seconds claims the frame, and standalone arms 10
+seconds after start when neither showed up — or *Force DLSS*, *Force FSR3* and *Force standalone*
+pick one outright. Its status line says what it is waiting for.
 
 **Neural Rendering** (the model's own parameters; changing one rebuilds the model on release)
 
@@ -187,6 +194,7 @@ Native D3D12 games with DLSS need nothing else. For the rest:
 
 | Game | Route |
 |---|---|
+| D3D12 game with FSR3 | **FSR3 session**: this add-on only, no ReShade depth or Launchpad setup needed; Source → *Auto* picks it when the game has no DLSS. |
 | D3D12, D3D11 or Vulkan, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
 | D3D11 or Vulkan, with DLSS | dlss5-bridge mirrors the game's DLSS (optional: standalone works too). |
 
@@ -272,6 +280,9 @@ The bridge's panel shows whether depth and motion inputs are bound. The substitu
 session fed approximated inputs, so text can soften and dense foliage can smear a little.
 
 ### Depth and motion vectors
+
+None of this applies to an **FSR3 session**: the add-on takes the game's color, depth and motion
+vectors straight from the FSR3 dispatch parameters, so there is nothing here to set up.
 
 1. Install [**iMMERSE**](https://github.com/martymcmodding/iMMERSE) from Marty's Mods (the
    ReShade installer offers it), enable **MartysMods_Launchpad** and move it to the top of the

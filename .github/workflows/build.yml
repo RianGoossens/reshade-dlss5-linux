@@ -34,6 +34,11 @@ jobs:
       - name: Build
         run: bash build.sh
 
+      # Host-side unit test: plain C++17, NR_HOST_MOCK builds the runner's Windows
+      # surface from the mock headers -- no cross toolchain needed.
+      - name: Unit test (ffx_extract_test)
+        run: g++ -std=c++17 -o /tmp/ffx_extract_test test/unit/ffx_extract_test.cpp && /tmp/ffx_extract_test
+
       # Always publish the built files as a workflow artifact so every push/PR
       # is downloadable, tag or not.
       - name: Upload build artifacts

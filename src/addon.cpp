@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,8 @@
 #include <reshade.hpp>
 
 #include "ngx_probe.hpp"
+#include "nr_fsr.hpp"  // FSR3 dispatch/create handlers (needs nr_runner, via ngx_probe)
+#include "ffx_api.hpp"
 #include "nr_d3d11.hpp"
 #include "nr_vulkan.hpp"
 
@@ -50,11 +53,44 @@ void LogWineVersion() {
   reshade::log::message(reshade::log::level::info, buf);
 }
 
+std::atomic_flag probe_install_busy = ATOMIC_FLAG_INIT;
+
+struct ProbeInstallGate {
+  const bool acquired = !probe_install_busy.test_and_set(std::memory_order_acquire);
+
+  ProbeInstallGate() = default;
+  ProbeInstallGate(const ProbeInstallGate&) = delete;
+  ProbeInstallGate& operator=(const ProbeInstallGate&) = delete;
+  ~ProbeInstallGate() {
+    if (acquired) probe_install_busy.clear(std::memory_order_release);
+  }
+};
+
+void TryInstallProbes(const char* stage, bool ngx, bool ffx) {
+  ProbeInstallGate gate;
+  if (!gate.acquired) return;
+  if (ngx) ngx_probe::TryInstall();
+  if (ffx && !ffx_probe::installed && ffx_probe::Install()) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "ffx-probe: attached at %s", stage);
+    reshade::log::message(reshade::log::level::info, buf);
+  }
+}
+
+void OnInitDevice(reshade::api::device* device) {
+  if (device->get_api() == reshade::api::device_api::d3d12) {
+    TryInstallProbes("init_device", false, true);
+  }
+}
+
 // get_resource_desc returns a large struct by value from a virtual method —
 // only ABI-safe because we build with clang targeting x86_64-pc-windows-msvc
 // (matching MSVC-built ReShade). A MinGW GCC build crashes on this call.
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   auto* device = swapchain->get_device();
+  if (device->get_api() == reshade::api::device_api::d3d12) {
+    TryInstallProbes("init_swapchain", false, true);
+  }
   const auto back_buffer = swapchain->get_back_buffer(0);
   const auto desc = device->get_resource_desc(back_buffer);
   const auto color_space = swapchain->get_color_space();
@@ -78,7 +114,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
 void OnPresent(reshade::api::command_queue*, reshade::api::swapchain*,
                const reshade::api::rect*, const reshade::api::rect*,
                uint32_t, const reshade::api::rect*) {
-  ngx_probe::TryInstall();
+  TryInstallProbes("present", true, true);
 
   // F10 toggles the NR pass, edge-triggered, for instant A/B comparison.
   static bool f10_was_down = false;
@@ -280,6 +316,28 @@ float Clamp(float v, float min, float max) { return v < min ? min : (v > max ? m
 void LoadSettings() {
   auto& s = nr_runner::s;
 
+  // StandaloneMode -> FrameSource migration (spec: same pattern as the encoding-6 one).
+  // The new key wins whenever present; only when it is absent and the legacy key exists is
+  // the legacy value translated (0 Auto -> 0, 1 Always -> 3 Force standalone, 2 Off -> 1
+  // Force DLSS), written under the new name and the old key deleted. Neither -> kFsAuto.
+  // frame_source is a relaxed atomic (overlay writes, dispatch/evaluate/present reads),
+  // so the ini plumbing goes through a plain int and stores once at the end.
+  int frame_source = 0;
+  if (!reshade::get_config_value(nullptr, kConfigSection, "FrameSource", frame_source)) {
+    int legacy = -1;
+    if (reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", legacy)) {
+      frame_source = legacy == 1 ? nr_runner::kFsStandalone
+                                 : legacy == 2 ? nr_runner::kFsDlss : nr_runner::kFsAuto;
+      reshade::set_config_value(nullptr, kConfigSection, "FrameSource", frame_source);
+      reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode",
+                                static_cast<const char*>(nullptr));
+    } else {
+      frame_source = nr_runner::kFsAuto;
+    }
+  }
+  if (frame_source < 0 || frame_source > nr_runner::kFsStandalone) frame_source = 0;
+  s.frame_source.store(frame_source, std::memory_order_relaxed);
+
   // Pre-mirror keys, read first so the new names win when both exist.
   reshade::get_config_value(nullptr, kConfigSection, "Intensity", s.intensity);
   reshade::get_config_value(nullptr, kConfigSection, "StructureIntensity", s.local_structure);
@@ -288,7 +346,6 @@ void LoadSettings() {
 
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
-  reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
   int model_resolution = nr_runner::kResFull;
   reshade::get_config_value(nullptr, kConfigSection, "ModelResolution", model_resolution);
   if (model_resolution != nr_runner::kResRender) model_resolution = nr_runner::kResFull;
@@ -354,7 +411,6 @@ void LoadSettings() {
   if (s.curve < 0 || s.curve > nr_runner::kCurveReinhard) s.curve = nr_runner::kCurveKnee;
   if (s.preset < 0 || s.preset > 7) s.preset = 0;
   if (s.pass_count < 1 || s.pass_count > nr_runner::kMaxPasses) s.pass_count = 1;
-  if (s.standalone_mode < 0 || s.standalone_mode > nr_runner::kSaOff) s.standalone_mode = 0;
   if (s.style < 0 || s.style > 2) s.style = 0;
 }
 
@@ -362,7 +418,8 @@ void SaveSettings() {
   auto& s = nr_runner::s;
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
-  reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
+  reshade::set_config_value(nullptr, kConfigSection, "FrameSource",
+                            s.frame_source.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "ModelResolution",
                             s.model_resolution.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
@@ -400,6 +457,9 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "GlobalIntensity",
                             static_cast<const char*>(nullptr));
   reshade::set_config_value(nullptr, kConfigSection, "Style",
+                            static_cast<const char*>(nullptr));
+  // Retired StandaloneMode, so a hand-restored copy cannot override FrameSource on load.
+  reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode",
                             static_cast<const char*>(nullptr));
 }
 
@@ -475,15 +535,30 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   Edit bridge;  // colour bridge and compose: live
 
   {
-    const char* source = s.source == nr_runner::kSrcDlss         ? "the game's DLSS session"
-                         : s.source == nr_runner::kSrcStandalone ? "standalone"
-                                                                 : "waiting for a frame";
-    ImGui::Text("Source: %s", source);
-    bridge |= Combo("Standalone##mode", &s.standalone_mode, "Auto\0Always\0Off\0", 0,
-                    "For D3D12 games without DLSS: run off the back buffer, ReShade's depth "
-                    "(Generic Depth) and iMMERSE Launchpad's motion vectors, with no bridge.\n"
-                    "Auto runs it only when the game has no DLSS of its own.");
-    if (s.sa_status[0] != 0 && s.source != nr_runner::kSrcDlss)
+    const int source = s.source.load(std::memory_order_relaxed);
+    const char* source_name = source == nr_runner::kSrcDlss         ? "the game's DLSS session"
+                              : source == nr_runner::kSrcFsr        ? "the game's FSR3 session"
+                              : source == nr_runner::kSrcStandalone ? "standalone"
+                                                                    : "waiting for a frame";
+    ImGui::Text("Source: %s", source_name);
+    int frame_source = s.frame_source.load(std::memory_order_relaxed);
+    Edit fs = Combo("Source##frame", &frame_source,
+                    "Auto\0Force DLSS\0Force FSR3\0Force standalone\0", 0,
+                    "Which session feeds the model: Auto walks the priority DLSS -> FSR3 -> "
+                    "standalone (a DLSS evaluate or FSR3 dispatch within the last 3 s claims "
+                    "the frame; standalone arms 10 s after start when neither showed up).\n"
+                    "Force DLSS runs only in the game's DLSS session, Force FSR3 only on FSR3 "
+                    "dispatches (the game's DLSS and standalone are ignored), Force standalone "
+                    "runs every frame except while the game's own DLSS is actively evaluating "
+                    "(it defers to a fresh DLSS session, not to FSR3).");
+    bridge |= fs;  // the ini save below persists the picker
+    if (fs.changed || fs.committed)
+      s.frame_source.store(frame_source, std::memory_order_relaxed);
+    // sa_status is standalone-only (spec): show it while no session has claimed the
+    // frame -- kSrcNone keeps the pre-claim "waiting: ..." strings visible (they are
+    // written while the source is still kSrcNone) -- and once standalone owns it.
+    if (s.sa_status[0] != 0 &&
+        (source == nr_runner::kSrcNone || source == nr_runner::kSrcStandalone))
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
   }
 
@@ -496,6 +571,9 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
         "much cheaper, at some loss of fine detail.\n"
         "In a game with DLSS: the frame before DLSS upscales it, at your DLSS preset's render "
         "resolution; DLSS then smooths some of the detail the model adds.\n"
+        "In a game with FSR3: Render runs the model on FSR's color input at render resolution "
+        "and FSR then upscales the enhanced frame; Full runs it on FSR's output at display "
+        "resolution.\n"
         "In standalone: applies when the depth buffer is smaller than the screen (a game with a "
         "separate resolution or render scale setting); only the model's change is scaled up, so "
         "the UI stays sharp.");
@@ -632,7 +710,7 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     Tip("Off resets the model's history every frame: no ghosting or drag from motion vectors, "
         "but less stable detail. A diagnostic: if drag disappears with this off, the motion "
         "vectors are the cause.");
-    ImGui::BeginDisabled(s.source != nr_runner::kSrcStandalone);
+    ImGui::BeginDisabled(s.source.load(std::memory_order_relaxed) != nr_runner::kSrcStandalone);
     ImGui::Checkbox("Flip motion X", &s.sa_flip_x);
     Tip("Standalone only. Reverses the motion vectors' horizontal direction; the right setting is "
         "the one where moving things drag least.");
@@ -661,11 +739,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
                             "DLSSNR Linux loaded (clang x86_64-pc-windows-msvc, built on Linux)");
       LogWineVersion();
       LoadSettings();
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::register_overlay("DLSSNR Linux", OnDrawOverlay);
-      ngx_probe::TryInstall();  // in case NGX is already resident
+      TryInstallProbes("process_attach", true, false);  // in case NGX is already resident
       break;
     case DLL_PROCESS_DETACH:
       // Non-null lp_reserved: the process is terminating and every other
@@ -676,6 +755,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       // where the detours must be removed before this image disappears.
       if (lp_reserved != nullptr) break;
       ngx_probe::Uninstall();
+      ffx_probe::Uninstall();
       nr_d3d11::Shutdown();
       nr_vulkan::Shutdown(nullptr);  // the device's own objects die with it
       nr_runner::Shutdown();
@@ -683,6 +763,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_addon(h_module);
       break;
   }
