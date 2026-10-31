@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned: apt.llvm.org has no repository for newer releases yet
     steps:
       - uses: actions/checkout@v4
 
